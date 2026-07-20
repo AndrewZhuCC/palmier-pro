@@ -76,7 +76,12 @@ final class MCPService {
         Log.mcp.notice("http server stopped")
     }
 
-    nonisolated static func registerTools(on server: Server, executor: ToolExecutor) async {
+    nonisolated static func registerTools(
+        on server: Server,
+        executor: ToolExecutor,
+        providerCredentialPrompter: any AIProviderCredentialPrompting = NativeAIProviderCredentialPrompter()
+    ) async {
+        await executor.setProviderCredentialPrompter(providerCredentialPrompter)
         let tools: [Tool] = ToolDefinitions.mcpServer.map { def in
             Tool(name: def.name.rawValue, description: def.description, inputSchema: def.mcpSchemaValue)
         }

@@ -1084,12 +1084,8 @@ private struct ProviderEditorSheet: View {
                     primaryCredentialOverride: built.primaryCredential,
                     secretHeaderOverrides: built.secretHeaderValues
                 )
-                if built.profile.agent != nil {
-                    try await AgentConnectionTester.test(runtimeProfile: runtime)
-                    statusText = "Connection succeeded."
-                } else {
-                    statusText = "Configuration is valid; generation catalog test will run when the adapter loads."
-                }
+                let result = try await AIProviderConnectionTester.test(runtimeProfile: runtime)
+                statusText = result.message
             } catch {
                 statusText = error.localizedDescription
             }

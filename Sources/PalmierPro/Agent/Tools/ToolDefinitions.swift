@@ -4,6 +4,7 @@ import MCP
 enum ToolName: String, CaseIterable, Sendable {
     // Projects
     case manageProject = "manage_project"
+    case manageAIProviders = "manage_ai_providers"
 
     // Timelines
     case getTimeline = "get_timeline"
@@ -1069,8 +1070,111 @@ enum ToolDefinitions {
         )
     )
 
-    static var mcpServer: [AgentTool] { all + [manageProject] }
+    static let manageAIProviders = AgentTool(
+        name: .manageAIProviders,
+        description: "Manage application-wide BYOK AI providers without requiring an open project. Actions: `list`; `create` from a preset or structured configuration; `update` with a non-secret patch; `set_credentials` using a secure Palmier Pro prompt; `set_active`; `test`; and confirmed `delete`. Never ask the user to paste API keys into chat and never place credentials in tool arguments. Secret header values are accepted only by action='set_credentials' and are stored directly in the macOS Keychain.",
+        inputSchema: objectSchema(
+            properties: [
+                "action": [
+                    "type": "string",
+                    "enum": ["list", "create", "update", "set_credentials", "set_active", "test", "delete"],
+                    "description": "Provider operation.",
+                ],
+                "providerId": ["type": "string", "description": "Provider UUID returned by action='list' or 'create'."],
+                "preset": [
+                    "type": "string",
+                    "enum": AIProviderToolCodec.presetIdentifiers,
+                    "description": "Create only. Optional starting preset; configuration can override its non-secret fields.",
+                ],
+                "configuration": providerConfigurationSchema(),
+                "operation": [
+                    "type": "string",
+                    "enum": ["prompt_missing", "replace", "remove"],
+                    "description": "set_credentials only. Securely prompt for missing values, replace selected values, or remove selected values.",
+                ],
+                "targets": [
+                    "type": "array",
+                    "items": ["type": "string"],
+                    "description": "set_credentials only. Optional list containing 'primary' and/or secret header UUIDs. Values themselves must never be supplied here.",
+                ],
+                "confirm": ["type": "boolean", "description": "delete only. Must be true."],
+            ],
+            required: ["action"]
+        )
+    )
+
+    static var mcpServer: [AgentTool] { all + [manageProject, manageAIProviders] }
     static var inAppAgent: [AgentTool] { all + [readSkill] }
+
+    private static func providerConfigurationSchema() -> [String: Any] {
+        let nullableString: [String: Any] = [
+            "oneOf": [["type": "string"], ["type": "null"]],
+        ]
+        let modelSchema: [String: Any] = [
+            "oneOf": [
+                ["type": "string"],
+                objectSchema(
+                    properties: [
+                        "id": ["type": "string"],
+                        "displayName": nullableString,
+                    ],
+                    required: ["id"]
+                ),
+            ],
+        ]
+        let agentSchema = objectSchema(properties: [
+            "protocol": [
+                "type": "string",
+                "enum": ["openai-responses", "openai-chat-completions", "anthropic-messages"],
+            ],
+            "endpointPath": ["type": "string"],
+            "defaultModelId": ["type": "string"],
+            "models": ["type": "array", "items": modelSchema],
+            "maxOutputTokens": ["type": "integer"],
+            "additionalBody": ["type": "object"],
+        ])
+        let generationSchema = objectSchema(properties: [
+            "kind": [
+                "type": "string",
+                "enum": ["fal-queue", "openai-media", "palmier-compatible-v1"],
+            ],
+            "endpointPath": nullableString,
+            "modelIds": ["type": "array", "items": ["type": "string"]],
+            "options": ["type": "object"],
+        ])
+        return objectSchema(properties: [
+            "name": ["type": "string"],
+            "baseURL": ["type": "string"],
+            "enabled": ["type": "boolean"],
+            "allowInsecureHTTP": ["type": "boolean"],
+            "allowCredentialRedirects": ["type": "boolean"],
+            "auth": objectSchema(properties: [
+                "kind": [
+                    "type": "string",
+                    "enum": ["bearer", "x-api-key", "custom-header", "none"],
+                ],
+                "headerName": nullableString,
+                "valuePrefix": nullableString,
+            ]),
+            "headers": [
+                "type": "array",
+                "items": objectSchema(
+                    properties: [
+                        "id": ["type": "string"],
+                        "name": ["type": "string"],
+                        "value": [
+                            "oneOf": [["type": "string"], ["type": "null"]],
+                            "description": "Public headers only. For isSecret=true, omit value and use action='set_credentials'.",
+                        ],
+                        "isSecret": ["type": "boolean"],
+                    ],
+                    required: ["name", "isSecret"]
+                ),
+            ],
+            "agent": ["oneOf": [agentSchema, ["type": "null"]]],
+            "generation": ["oneOf": [generationSchema, ["type": "null"]]],
+        ])
+    }
 
     private static func textBoxTransformProperties() -> [String: [String: Any]] {
         [
