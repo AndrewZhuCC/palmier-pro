@@ -8,21 +8,22 @@ struct AIEditMenu: View {
     var body: some View {
         if availableActions.isEmpty && availableAudioTransforms.isEmpty {
             EmptyView()
-        } else if !aiAllowed {
-            Button("AI Edit") {}.disabled(true)
         } else {
             Menu("AI Edit") {
                 if availableActions.contains(.upscale) {
                     Menu("Upscale") {
                         ForEach(UpscaleModelConfig.models(for: asset.type)) { model in
-                            if model.paidOnly && !AccountService.shared.isPaid {
-                                Button {
-                                    SettingsWindowController.shared.show(tab: .account)
-                                } label: {
-                                    Label("\(model.displayName) (Paid)", systemImage: "lock.fill")
-                                }
-                            } else {
+                            if GenerationAccessPolicy.isAvailable(
+                                modelID: model.id,
+                                paidOnly: model.paidOnly
+                            ) {
                                 Button(model.displayName) { runUpscale(model) }
+                            } else {
+                                Button {
+                                    openProviderSettings(for: model.entry)
+                                } label: {
+                                    Label("\(model.displayName) (Configure)", systemImage: "lock.fill")
+                                }
                             }
                         }
                     }
@@ -55,11 +56,6 @@ struct AIEditMenu: View {
         }
     }
 
-    private var aiAllowed: Bool {
-        let account = AccountService.shared
-        return account.isSignedIn && !account.isMisconfigured
-    }
-
     private var availableActions: [EditAction] {
         EditAction.available(for: asset)
     }
@@ -70,6 +66,14 @@ struct AIEditMenu: View {
 
     private func runUpscale(_ model: UpscaleModelConfig) {
         _ = EditSubmitter.submitUpscale(asset: asset, model: model, editor: editor)
+    }
+
+    private func openProviderSettings(for entry: CatalogEntry) {
+        if entry.providerKind == .palmierManaged {
+            SettingsWindowController.shared.show(tab: .account)
+        } else {
+            SettingsWindowController.shared.show(tab: .providers)
+        }
     }
 
     private func edit() {

@@ -5,85 +5,91 @@ import Observation
 @MainActor
 final class AgentService {
 
-    private var apiKey: String = ""
-    private var apiKeyObserver: NSObjectProtocol?
+    private var providerStore: AIProviderStore { .shared }
+    private var modelSelectionRevision = 0
 
-    init() {
-        reloadAPIKey()
-        apiKeyObserver = NotificationCenter.default.addObserver(
-            forName: .anthropicAPIKeyChanged,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.reloadAPIKey()
-            }
-        }
+    var activeProvider: AIProviderProfile? { providerStore.activeAgentProfile }
+
+    var activeProviderName: String {
+        activeProvider?.name ?? "No provider"
     }
 
-    private func reloadAPIKey() {
-        Task { [weak self] in
-            let key = await Task.detached(priority: .utility) {
-                AnthropicKeychain.load() ?? ""
-            }.value
-            self?.apiKey = key
-        }
+    var isUsingBYOK: Bool {
+        guard let activeProvider else { return false }
+        return !activeProvider.isManagedPalmier
     }
 
-    isolated deinit {
-        if let token = apiKeyObserver {
-            NotificationCenter.default.removeObserver(token)
-        }
+    // Compatibility for existing views while provider-aware UI is wired.
+    var hasApiKey: Bool {
+        guard let activeProvider, isUsingBYOK else { return false }
+        return providerStore.hasCredential(for: activeProvider)
     }
-
-    var hasApiKey: Bool { !apiKey.isEmpty }
 
     var canStream: Bool {
-        if hasApiKey { return true }
-        let account = AccountService.shared
-        return account.isSignedIn && account.hasCredits
-    }
-
-    var availableModels: [AnthropicModel] {
-        if hasApiKey { return AnthropicModel.allCases }
-        return [.sonnet5]
-    }
-
-    private func selectClient() -> (any AgentClient)? {
-        let chosen = effectiveModel
-        if hasApiKey { return AnthropicClient(apiKey: apiKey, model: chosen) }
-        if AccountService.shared.isSignedIn {
-            return PalmierClient(model: chosen)
+        guard let activeProvider else { return false }
+        if activeProvider.isManagedPalmier {
+            let account = AccountService.shared
+            return account.isSignedIn && account.hasCredits
         }
-        return nil
+        return providerStore.hasCredential(for: activeProvider)
     }
 
-    var effectiveModel: AnthropicModel {
-        let available = availableModels
-        if available.contains(model) { return model }
-        return available.first ?? .sonnet5
-    }
-
-    var model: AnthropicModel = {
-        if let raw = UserDefaults.standard.string(forKey: "agentModel"),
-           let m = AnthropicModel(rawValue: raw) {
-            return m
+    var availableModels: [AgentModelOption] {
+        guard let configuration = activeProvider?.agent else { return [] }
+        var models = configuration.models
+        if !models.contains(where: { $0.modelID == configuration.defaultModelID }) {
+            models.insert(AgentModelOption(modelID: configuration.defaultModelID), at: 0)
         }
-        return .sonnet5
-    }() {
-        didSet { UserDefaults.standard.set(model.rawValue, forKey: "agentModel") }
+        return models
+    }
+
+    var effectiveModel: AgentModelOption {
+        _ = modelSelectionRevision
+        guard let profile = activeProvider, let configuration = profile.agent else {
+            return AgentModelOption(modelID: "")
+        }
+        let selected = UserDefaults.standard.string(forKey: modelSelectionKey(profileID: profile.id))
+        return availableModels.first(where: { $0.modelID == selected })
+            ?? availableModels.first(where: { $0.modelID == configuration.defaultModelID })
+            ?? AgentModelOption(modelID: configuration.defaultModelID)
+    }
+
+    func selectModel(_ modelID: String) {
+        guard let profile = activeProvider,
+              availableModels.contains(where: { $0.modelID == modelID }) else { return }
+        UserDefaults.standard.set(modelID, forKey: modelSelectionKey(profileID: profile.id))
+        modelSelectionRevision &+= 1
+    }
+
+    private func modelSelectionKey(profileID: UUID) -> String {
+        "agentModel.\(profileID.uuidString.lowercased())"
+    }
+
+    private var unavailableError: AIProviderError {
+        guard let activeProvider else {
+            return .invalidConfiguration("Configure an AI provider to start a chat.")
+        }
+        if activeProvider.isManagedPalmier {
+            let account = AccountService.shared
+            if !account.isSignedIn {
+                return .authenticationRequired("Sign in to use the Palmier Cloud AI agent.")
+            }
+            return .paymentRequired("Palmier Cloud requires an active plan and available credits.")
+        }
+        return .missingCredential("Add credentials for the selected AI provider in Settings.")
     }
 
     var sessions: [ChatSession] = []
     var currentSessionId: UUID?
     var messages: [AgentMessage] = []
     var isStreaming: Bool = false
-    var streamError: PalmierClientError?
+    var streamError: AIProviderError?
     var onSessionsChanged: (@MainActor () -> Void)?
 
     var draft: String = ""
     var mentions: [AgentMention] = []
     private static let clipMentionLabelMaxLength = 24
+    private static let maxToolRoundsPerTurn = 32
 
     func attachMention(for asset: MediaAsset) {
         editor?.agentPanelVisible = true
@@ -298,7 +304,7 @@ final class AgentService {
 
     func send(text: String, mentions: [AgentMention]) {
         guard canStream else {
-            streamError = .upstream("Sign in to a paid plan or add an Anthropic API key to start.")
+            streamError = unavailableError
             return
         }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -312,7 +318,8 @@ final class AgentService {
         )
         let analyticsPayload: [String: Any] = [
             "project_id": editor?.projectId ?? "unknown",
-            "model": effectiveModel.rawValue,
+            "model": effectiveModel.modelID,
+            "provider": activeProvider?.id.uuidString ?? "unconfigured",
         ]
         if sessionActivation.activate() {
             Analytics.capture(.agentSessionStarted, properties: analyticsPayload)
@@ -320,8 +327,12 @@ final class AgentService {
 
         resolveOrphanToolUses()
         messages.append(AgentMessage(
-            role: .user, blocks: [.text(trimmed)],
-            mentions: referencedMentions, contextHint: contextHint
+            role: .user,
+            blocks: [.text(trimmed)],
+            mentions: referencedMentions,
+            contextHint: contextHint,
+            providerProfileID: activeProvider?.id,
+            modelID: effectiveModel.modelID
         ))
         streamError = nil
         kickOffStream()
@@ -353,44 +364,89 @@ final class AgentService {
     }
 
     private func runLoop() async {
-        guard let client = selectClient() else {
-            streamError = .upstream("No backend available.")
+        guard let profile = activeProvider, let configuration = profile.agent else {
+            streamError = .invalidConfiguration("Configure an AI provider to start a chat.")
             return
         }
-        await SkillStore.shared.reloadInBackground()
-        let tools = ToolDefinitions.inAppAgent.map {
-            AnthropicToolSchema(name: $0.name.rawValue, description: $0.description, inputSchema: $0.inputSchema)
+        let modelID = effectiveModel.modelID
+        let runtimeProfile: AIProviderRuntimeProfile
+        let client: any AgentClient
+        do {
+            runtimeProfile = try await providerStore.runtimeProfile(id: profile.id)
+            client = try AgentClientFactory.make(runtimeProfile: runtimeProfile)
+        } catch let error as AIProviderError {
+            streamError = error
+            return
+        } catch let error as AIProviderRuntimeError {
+            streamError = .missingCredential(error.localizedDescription)
+            return
+        } catch {
+            streamError = .invalidConfiguration(error.localizedDescription)
+            return
         }
 
+        await SkillStore.shared.reloadInBackground()
+        let tools: [AgentToolDefinition]
+        do {
+            tools = try ToolDefinitions.inAppAgent.map {
+                AgentToolDefinition(
+                    name: $0.name.rawValue,
+                    description: $0.description,
+                    inputSchema: try JSONValue(foundationValue: $0.inputSchema)
+                )
+            }
+        } catch {
+            streamError = .invalidConfiguration("An in-app tool has an invalid JSON schema.")
+            return
+        }
+
+        var toolRoundCount = 0
         loop: while !Task.isCancelled {
             resolveOrphanToolUses()
-            let apiMsgs = await apiMessages()
-            let assistant = AgentMessage(role: .assistant, blocks: [])
+            let conversation = await apiMessages()
+            let assistant = AgentMessage(
+                role: .assistant,
+                blocks: [],
+                providerProfileID: profile.id,
+                modelID: modelID
+            )
             messages.append(assistant)
             let assistantID = assistant.id
 
             do {
-                let stream = client.stream(
-                    system: AgentInstructions.serverInstructions + AgentInstructions.skillsSection(SkillStore.shared.skillIndex),
+                let request = AgentRequest(
+                    model: modelID,
+                    maxOutputTokens: configuration.maxOutputTokens,
+                    system: AgentInstructions.serverInstructions
+                        + AgentInstructions.skillsSection(SkillStore.shared.skillIndex),
                     tools: tools,
-                    messages: apiMsgs
+                    messages: conversation,
+                    additionalBody: configuration.additionalBody
                 )
-
-                var stopReason: AnthropicStopReason = .endTurn
+                let stream = client.stream(request: request)
+                var finishReason: AgentFinishReason = .completed
 
                 for try await event in stream {
                     try Task.checkCancellation()
                     switch event {
                     case .textDelta(let chunk):
                         appendTextDelta(chunk, toAssistant: assistantID)
-                    case .toolUseComplete(let id, let name, let inputJSON):
+                    case .toolCallComplete(let id, let name, let inputJSON):
                         appendToolUse(id: id, name: name, inputJSON: inputJSON, toAssistant: assistantID)
-                    case .messageStop(let reason):
-                        stopReason = reason
+                    case .finish(let reason):
+                        finishReason = reason
+                    case .usage:
+                        break
                     }
                 }
 
-                if stopReason == .toolUse {
+                if finishReason == .toolCalls {
+                    toolRoundCount += 1
+                    guard toolRoundCount <= Self.maxToolRoundsPerTurn else {
+                        resolveOrphanToolUses(reason: "Tool-call limit exceeded")
+                        streamError = .invalidResponse("The provider exceeded the tool-call round limit.")
+                        break loop
+                    }
                     await runPendingToolUses(assistantID: assistantID)
                     continue loop
                 }
@@ -398,13 +454,13 @@ final class AgentService {
             } catch is CancellationError {
                 dropEmptyAssistantTurn(id: assistantID)
                 break loop
-            } catch let err as PalmierClientError {
+            } catch let error as AIProviderError {
                 dropEmptyAssistantTurn(id: assistantID)
-                streamError = err
+                streamError = error
                 break loop
             } catch {
                 dropEmptyAssistantTurn(id: assistantID)
-                streamError = .upstream(error.localizedDescription)
+                streamError = .transport(error.localizedDescription)
                 break loop
             }
         }
@@ -532,20 +588,23 @@ final class AgentService {
         }
     }
 
-    private func apiMessages() async -> [AnthropicMessage] {
-        var result: [AnthropicMessage] = []
-        for msg in messages {
-            if msg.role == .system { continue }
-            var content = msg.blocks.compactMap(Self.contentBlockJSON)
-            if msg.role == .user, !msg.mentions.isEmpty {
-                let inlined = await inlineImageBlocks(for: msg.mentions)
-                var hint = msg.contextHint ?? AgentMentionContext.hint(msg.mentions, editor: editor)
+    private func apiMessages() async -> [AgentConversationMessage] {
+        var result: [AgentConversationMessage] = []
+        for message in messages {
+            if message.role == .system { continue }
+            var content = message.blocks.compactMap(Self.inputBlock)
+            if message.role == .user, !message.mentions.isEmpty {
+                let inlined = await inlineImageBlocks(for: message.mentions)
+                var hint = message.contextHint ?? AgentMentionContext.hint(message.mentions, editor: editor)
                 if let note = AgentMentionContext.inlineNote(for: inlined) { hint += " " + note }
                 content.insert(contentsOf: inlined.blocks, at: 0)
-                content.insert(["type": "text", "text": hint], at: 0)
+                content.insert(.text(hint), at: 0)
             }
             guard !content.isEmpty else { continue }
-            result.append(AnthropicMessage(role: msg.role == .user ? .user : .assistant, content: content))
+            result.append(AgentConversationMessage(
+                role: message.role == .user ? .user : .assistant,
+                content: content
+            ))
         }
         return result
     }
@@ -579,37 +638,32 @@ final class AgentService {
                 out.failures[mediaRef] = "could not read or decode image file"
                 continue
             }
-            out.blocks.append([
-                "type": "image",
-                "source": ["type": "base64", "media_type": mime, "data": base64],
-            ])
+            out.blocks.append(.image(base64: base64, mimeType: mime))
             out.inlinedIds.insert(mediaRef)
         }
         return out
     }
 
-    private static func contentBlockJSON(_ block: AgentContentBlock) -> [String: Any]? {
+    private static func inputBlock(_ block: AgentContentBlock) -> AgentInputBlock? {
         switch block {
-        case .text(let s):
-            guard !s.isEmpty else { return nil }
-            return ["type": "text", "text": s]
+        case .text(let text):
+            guard !text.isEmpty else { return nil }
+            return .text(text)
         case .toolUse(let id, let name, let inputJSON):
-            return [
-                "type": "tool_use", "id": id, "name": name,
-                "input": parseJSONObject(inputJSON),
-            ]
-        case .toolResult(let toolUseId, let content, let isError):
-            let contentJSON: [[String: Any]] = content.map {
-                switch $0 {
-                case .text(let s): return ["type": "text", "text": s]
-                case .image(let base64, let mime):
-                    return ["type": "image", "source": ["type": "base64", "media_type": mime, "data": base64]]
-                }
-            }
-            return [
-                "type": "tool_result", "tool_use_id": toolUseId,
-                "content": contentJSON, "is_error": isError,
-            ]
+            return .toolCall(id: id, name: name, inputJSON: inputJSON)
+        case .toolResult(let toolUseID, let content, let isError):
+            return .toolResult(
+                toolCallID: toolUseID,
+                content: content.map { block in
+                    switch block {
+                    case .text(let text):
+                        .text(text)
+                    case .image(let base64, let mimeType):
+                        .image(base64: base64, mimeType: mimeType)
+                    }
+                },
+                isError: isError
+            )
         }
     }
 
@@ -631,13 +685,25 @@ struct AgentMessage: Identifiable, Codable {
     var blocks: [AgentContentBlock]
     var mentions: [AgentMention]
     var contextHint: String?
+    var providerProfileID: UUID?
+    var modelID: String?
 
-    init(id: UUID = UUID(), role: Role, blocks: [AgentContentBlock], mentions: [AgentMention] = [], contextHint: String? = nil) {
+    init(
+        id: UUID = UUID(),
+        role: Role,
+        blocks: [AgentContentBlock],
+        mentions: [AgentMention] = [],
+        contextHint: String? = nil,
+        providerProfileID: UUID? = nil,
+        modelID: String? = nil
+    ) {
         self.id = id
         self.role = role
         self.blocks = blocks
         self.mentions = mentions
         self.contextHint = contextHint
+        self.providerProfileID = providerProfileID
+        self.modelID = modelID
     }
 }
 

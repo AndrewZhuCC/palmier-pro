@@ -2,7 +2,6 @@ import SwiftUI
 
 struct MusicTab: View {
     @Environment(EditorViewModel.self) var editor
-    @Bindable private var account = AccountService.shared
 
     @State private var selectedModelId: String?
     @State private var mode: MusicGenerationSubmission.Mode = .videoToMusic
@@ -13,7 +12,11 @@ struct MusicTab: View {
     @State private var note: String?
 
     private var models: [AudioModelConfig] {
-        AudioModelConfig.allModels.filter { $0.inputs.contains(.video) && $0.category == .music }
+        AudioModelConfig.allModels.filter {
+            $0.inputs.contains(.video)
+                && $0.category == .music
+                && GenerationAccessPolicy.isAvailable(modelID: $0.id, paidOnly: $0.paidOnly)
+        }
     }
 
     private var model: AudioModelConfig? {
@@ -52,7 +55,9 @@ struct MusicTab: View {
     }
 
     private var estimatedCost: Int? {
-        guard let model, costDuration > 0 else { return nil }
+        guard let model,
+              model.entry.providerKind == .palmierManaged,
+              costDuration > 0 else { return nil }
         return CostEstimator.audioCost(model: model, prompt: trimmedPrompt, durationSeconds: costDuration)
     }
 
@@ -196,8 +201,7 @@ struct MusicTab: View {
                 }
                 .buttonStyle(.editorPrimary)
                 .focusable(false)
-                .disabled(!canGenerate || !account.aiAllowed)
-                .help(account.aiAllowed ? "" : "Sign in to generate")
+                .disabled(!canGenerate)
 
                 agentMenu
             }

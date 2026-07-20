@@ -32,15 +32,27 @@ final class MediaAsset: Identifiable {
     var pendingDownloadURL: URL?
     var cachedRemoteURL: String?
     var cachedRemoteURLExpiresAt: Date?
+    var cachedRemoteProviderProfileID: UUID?
     private var thumbnailMaxPixelSize = 0
 
-    /// Returns the cached URL if it's set AND not expired; else nil.
-    var freshRemoteURL: String? {
-        guard let url = cachedRemoteURL,
+    /// Returns the cached URL if it belongs to the requested provider and is not expired.
+    func freshRemoteURL(for providerProfileID: UUID) -> String? {
+        guard cachedRemoteProviderProfileID == providerProfileID else { return nil }
+        return freshRemoteURL
+    }
+
+    private var freshRemoteURL: String? {
+        guard let rawURL = cachedRemoteURL,
+              let url = URL(string: rawURL),
+              url.scheme == "https" || url.scheme == "http",
+              url.user == nil,
+              url.password == nil,
+              url.query == nil,
+              url.fragment == nil,
               let expiresAt = cachedRemoteURLExpiresAt,
               expiresAt > Date()
         else { return nil }
-        return url
+        return rawURL
     }
 
     enum GenerationStatus: Equatable {
@@ -86,7 +98,8 @@ final class MediaAsset: Identifiable {
     var isGenerated: Bool { generationInput != nil }
     var canResumeGeneration: Bool {
         guard let generationInput else { return false }
-        return generationInput.backendJobId?.isEmpty == false
+        if generationInput.resultURLs?.isEmpty == false { return true }
+        return generationInput.providerJob != nil || generationInput.backendJobId?.isEmpty == false
     }
     var isGenerating: Bool {
         generationStatus == .preparing || generationStatus == .generating || generationStatus == .downloading || generationStatus == .rendering
@@ -128,9 +141,27 @@ final class MediaAsset: Identifiable {
         self.folderId = entry.folderId
         self.cachedRemoteURL = entry.cachedRemoteURL
         self.cachedRemoteURLExpiresAt = entry.cachedRemoteURLExpiresAt
+        self.cachedRemoteProviderProfileID = entry.cachedRemoteProviderProfileID
         self.importInput = entry.importInput
         let restoredStatus = GenerationStatus(serialized: entry.generationStatus)
         self.generationStatus = restoredStatus == .preparing && !canResumeGeneration ? .none : restoredStatus
+        let shouldRestorePendingDownload: Bool = {
+            switch generationStatus {
+            case .downloading: true
+            case .failed: true
+            default: false
+            }
+        }()
+        if shouldRestorePendingDownload {
+            let outputIndex = generationInput?.outputIndex ?? 0
+            if let resultURLs = generationInput?.resultURLs,
+               resultURLs.indices.contains(outputIndex),
+               let remoteURL = URL(string: resultURLs[outputIndex]),
+               let scheme = remoteURL.scheme?.lowercased(),
+               scheme == "http" || scheme == "https" {
+                self.pendingDownloadURL = remoteURL
+            }
+        }
     }
 
     /// Produce a serializable manifest entry from this asset.
@@ -150,6 +181,7 @@ final class MediaAsset: Identifiable {
             hasAudio: hasAudio, folderId: folderId,
             cachedRemoteURL: fresh,
             cachedRemoteURLExpiresAt: fresh == nil ? nil : cachedRemoteURLExpiresAt,
+            cachedRemoteProviderProfileID: fresh == nil ? nil : cachedRemoteProviderProfileID,
             generationStatus: generationStatus.manifestValue,
             importInput: importInput,
         )

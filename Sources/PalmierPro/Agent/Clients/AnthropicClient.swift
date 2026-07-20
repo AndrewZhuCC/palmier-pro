@@ -14,10 +14,10 @@ enum AnthropicKeychain {
 
     static func load() -> String? {
         #if DEBUG
-        if let env = ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"]?
+        if let environmentKey = ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
-           !env.isEmpty {
-            return env
+           !environmentKey.isEmpty {
+            return environmentKey
         }
         #endif
         return KeychainStore.load(account: account)
@@ -30,24 +30,29 @@ enum AnthropicKeychain {
 }
 
 struct AnthropicClient: AgentClient {
-    let apiKey: String
-    let model: AnthropicModel
-    var maxTokens: Int = 8192
+    let runtimeProfile: AIProviderRuntimeProfile
+    let transport: any AIHTTPTransporting
 
-    private static let endpoint = URL(string: "https://api.anthropic.com/v1/messages")!
+    init(
+        runtimeProfile: AIProviderRuntimeProfile,
+        transport: any AIHTTPTransporting = AIURLSessionTransport.shared
+    ) {
+        self.runtimeProfile = runtimeProfile
+        self.transport = transport
+    }
 
-    func stream(
-        system: String,
-        tools: [AnthropicToolSchema],
-        messages: [AnthropicMessage]
-    ) -> AsyncThrowingStream<AnthropicStreamEvent, Error> {
+    func stream(request: AgentRequest) -> AsyncThrowingStream<AgentStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    try await run(system: system, tools: tools, messages: messages, continuation: continuation)
+                    try await run(request: request, continuation: continuation)
                     continuation.finish()
-                } catch {
+                } catch is CancellationError {
+                    continuation.finish(throwing: CancellationError())
+                } catch let error as AIProviderError {
                     continuation.finish(throwing: error)
+                } catch {
+                    continuation.finish(throwing: AIProviderError.transport(error.localizedDescription))
                 }
             }
             continuation.onTermination = { _ in task.cancel() }
@@ -55,33 +60,63 @@ struct AnthropicClient: AgentClient {
     }
 
     private func run(
-        system: String,
-        tools: [AnthropicToolSchema],
-        messages: [AnthropicMessage],
-        continuation: AsyncThrowingStream<AnthropicStreamEvent, Error>.Continuation
+        request: AgentRequest,
+        continuation: AsyncThrowingStream<AgentStreamEvent, Error>.Continuation
     ) async throws {
-        guard !apiKey.isEmpty else { throw AnthropicClientError.missingAPIKey }
+        guard let configuration = runtimeProfile.profile.agent,
+              configuration.wireProtocol == .anthropicMessages else {
+            throw AIProviderError.invalidConfiguration("This provider is not configured for Anthropic Messages.")
+        }
+        guard runtimeProfile.primaryCredential?.isEmpty == false else {
+            throw AIProviderError.missingCredential("The selected Anthropic provider is missing its API key.")
+        }
 
-        var request = URLRequest(url: Self.endpoint)
-        request.httpMethod = "POST"
-        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
-        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        request.setValue("application/json", forHTTPHeaderField: "content-type")
-        request.setValue("text/event-stream", forHTTPHeaderField: "accept")
-        request.httpBody = try JSONSerialization.data(
-            withJSONObject: AnthropicRequestBody.build(
-                model: model, maxTokens: maxTokens, system: system, tools: tools, messages: messages
-            ),
+        let endpoint = try AIProviderEndpoint.resolve(
+            baseURL: runtimeProfile.profile.baseURL,
+            endpointPath: configuration.endpointPath,
+            allowInsecureHTTP: runtimeProfile.profile.allowInsecureHTTP
+        )
+        var urlRequest = URLRequest(url: endpoint)
+        urlRequest.httpMethod = "POST"
+        urlRequest.applyProviderHeaders(runtimeProfile)
+        if urlRequest.value(forHTTPHeaderField: "anthropic-version") == nil {
+            urlRequest.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        }
+        urlRequest.setValue("application/json", forHTTPHeaderField: "content-type")
+        urlRequest.setValue("text/event-stream", forHTTPHeaderField: "accept")
+        urlRequest.httpBody = try JSONSerialization.data(
+            withJSONObject: AnthropicRequestBody.build(request: request),
             options: [.sortedKeys]
         )
 
-        let (bytes, response) = try await URLSession.shared.bytes(for: request)
-        if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
-            var body = ""
-            for try await line in bytes.lines { body += line + "\n" }
-            throw AnthropicClientError.httpError(status: http.statusCode, body: body)
+        let response = try await transport.lines(for: urlRequest)
+        defer { response.cancel() }
+        guard response.response.statusCode < 400 else {
+            _ = try? await AgentStreamSupport.collectErrorText(from: response.lines)
+            throw AIProviderError.fromHTTP(
+                status: response.response.statusCode,
+                retryAfter: response.response.value(forHTTPHeaderField: "Retry-After")
+            )
         }
 
-        try await AnthropicSSE.parse(bytes: bytes, continuation: continuation)
+        var parser = SSEParser()
+        var decoder = AnthropicStreamDecoder()
+        try await withTaskCancellationHandler {
+            for try await line in response.lines {
+                try Task.checkCancellation()
+                if let serverEvent = parser.consume(line: line) {
+                    for event in try decoder.decode(serverEvent) {
+                        continuation.yield(event)
+                    }
+                }
+            }
+            if let serverEvent = parser.finish() {
+                for event in try decoder.decode(serverEvent) {
+                    continuation.yield(event)
+                }
+            }
+        } onCancel: {
+            response.cancel()
+        }
     }
 }

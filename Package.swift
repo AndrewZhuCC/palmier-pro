@@ -14,6 +14,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.11.0"),
+        .package(url: "https://github.com/fal-ai/fal-swift", from: "0.5.6"),
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.7.0"),
         .package(url: "https://github.com/getsentry/sentry-cocoa", exact: "9.21.0"),
         .package(url: "https://github.com/PostHog/posthog-ios.git", exact: "3.64.4"),
@@ -30,6 +31,7 @@ let package = Package(
             name: "PalmierPro",
             dependencies: [
                 .product(name: "MCP", package: "swift-sdk"),
+                .product(name: "FalClient", package: "fal-swift"),
                 .product(name: "Sparkle", package: "Sparkle"),
                 .product(
                     name: "Sentry",

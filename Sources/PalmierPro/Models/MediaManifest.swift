@@ -31,6 +31,7 @@ struct MediaManifestEntry: Codable, Sendable, Equatable, Identifiable {
     var folderId: String?
     var cachedRemoteURL: String?
     var cachedRemoteURLExpiresAt: Date?
+    var cachedRemoteProviderProfileID: UUID?
     var generationStatus: String?
     var importInput: MediaImportInput?
 }
@@ -70,6 +71,9 @@ struct GenerationInput: Codable, Sendable, Equatable {
     var referenceAudioAssetIds: [String]?
     var createdAt: Date?
     var backendJobId: String?
+    var providerProfileID: UUID?
+    var providerKind: GenerationProviderKind?
+    var providerJob: GenerationJobHandle?
     var outputIndex: Int?
     var resultURLs: [String]?
 }

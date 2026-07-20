@@ -126,10 +126,16 @@ final class MCPService {
     private static func readResource(uri: String) -> ReadResource.Result {
         switch uri {
         case "palmier://models/video":
-            let json = ToolExecutor.jsonString(VideoModelConfig.allModels.map { ToolExecutor.videoModelInfo($0) }) ?? "[]"
+            let models = VideoModelConfig.allModels.filter {
+                GenerationAccessPolicy.isAvailable(modelID: $0.id, paidOnly: $0.paidOnly)
+            }
+            let json = ToolExecutor.jsonString(models.map { ToolExecutor.videoModelInfo($0) }) ?? "[]"
             return .init(contents: [.text(json, uri: uri, mimeType: "application/json")])
         case "palmier://models/image":
-            let json = ToolExecutor.jsonString(ImageModelConfig.allModels.map { ToolExecutor.imageModelInfo($0) }) ?? "[]"
+            let models = ImageModelConfig.allModels.filter {
+                GenerationAccessPolicy.isAvailable(modelID: $0.id, paidOnly: $0.paidOnly)
+            }
+            let json = ToolExecutor.jsonString(models.map { ToolExecutor.imageModelInfo($0) }) ?? "[]"
             return .init(contents: [.text(json, uri: uri, mimeType: "application/json")])
         default:
             return .init(contents: [.text("Unknown resource: \(uri)", uri: uri)])

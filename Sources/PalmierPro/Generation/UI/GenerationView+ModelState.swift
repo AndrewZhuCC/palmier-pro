@@ -11,16 +11,47 @@ extension GenerationView {
     var imageModel: ImageModelConfig { selectedModel(imageModels, at: selectedImageModelIndex) }
     var audioModel: AudioModelConfig { selectedModel(audioModels, at: selectedAudioModelIndex) }
 
-    var catalogReady: Bool {
-        !videoModels.isEmpty
-            && !imageModels.isEmpty
-            && !audioModels.isEmpty
+    var availableGenerationTypes: [GenerationType] {
+        GenerationType.allCases.filter { type in
+            switch type {
+            case .video: !enabledVideoModels.isEmpty
+            case .image: !enabledImageModels.isEmpty
+            case .audio: !enabledAudioModels.isEmpty
+            }
+        }
     }
 
-    var aiAllowed: Bool { account.aiAllowed }
+    var catalogReady: Bool {
+        ModelCatalog.shared.isLoaded && !availableGenerationTypes.isEmpty
+    }
+
+    var currentModelEntry: CatalogEntry {
+        switch selectedType {
+        case .video: videoModel.entry
+        case .image: imageModel.entry
+        case .audio: audioModel.entry
+        }
+    }
+
+    var currentModelUsesPalmier: Bool {
+        currentModelEntry.providerKind == .palmierManaged
+    }
+
+    var currentGenerationProviderName: String {
+        guard let profileID = currentModelEntry.providerProfileID else { return "Unknown provider" }
+        return AIProviderStore.shared.profile(id: profileID)?.name ?? "Unknown provider"
+    }
+
+    var aiAllowed: Bool {
+        guard let profileID = currentModelEntry.providerProfileID,
+              let profile = AIProviderStore.shared.profile(id: profileID),
+              profile.enabled else { return false }
+        if profile.isManagedPalmier { return account.aiAllowed }
+        return AIProviderStore.shared.hasCredential(for: profile)
+    }
 
     var currentModelLocked: Bool {
-        guard !account.isPaid else { return false }
+        guard currentModelUsesPalmier, !account.isPaid else { return false }
         switch selectedType {
         case .video: return videoModel.paidOnly
         case .image: return imageModel.paidOnly
@@ -33,21 +64,23 @@ extension GenerationView {
         return models[safeIndex]
     }
 
-    private func isAvailable(_ paidOnly: Bool) -> Bool { account.isPaid || !paidOnly }
+    private func isAvailable(_ entry: CatalogEntry) -> Bool {
+        entry.providerKind != .palmierManaged || account.isPaid || !entry.paidOnly
+    }
 
     var enabledVideoModels: [(index: Int, model: VideoModelConfig)] {
         videoModels.enumerated()
-            .filter { ModelPreferences.shared.isEnabled($0.element.id) && isAvailable($0.element.paidOnly) }
+            .filter { ModelPreferences.shared.isEnabled($0.element.id) && isAvailable($0.element.entry) }
             .map { (index: $0.offset, model: $0.element) }
     }
     var enabledImageModels: [(index: Int, model: ImageModelConfig)] {
         imageModels.enumerated()
-            .filter { ModelPreferences.shared.isEnabled($0.element.id) && isAvailable($0.element.paidOnly) }
+            .filter { ModelPreferences.shared.isEnabled($0.element.id) && isAvailable($0.element.entry) }
             .map { (index: $0.offset, model: $0.element) }
     }
     var enabledAudioModels: [(index: Int, model: AudioModelConfig)] {
         audioModels.enumerated()
-            .filter { ModelPreferences.shared.isEnabled($0.element.id) && isAvailable($0.element.paidOnly) }
+            .filter { ModelPreferences.shared.isEnabled($0.element.id) && isAvailable($0.element.entry) }
             .map { (index: $0.offset, model: $0.element) }
     }
     var enabledAudioModelsByCategory: [AudioModelConfig.Category: [(index: Int, model: AudioModelConfig)]] {
@@ -60,6 +93,9 @@ extension GenerationView {
     }
 
     func normalizeModelSelection() {
+        if !availableGenerationTypes.contains(selectedType), let first = availableGenerationTypes.first {
+            selectedType = first
+        }
         switch selectedType {
         case .video:
             if !enabledVideoModels.contains(where: { $0.index == selectedVideoModelIndex }) {

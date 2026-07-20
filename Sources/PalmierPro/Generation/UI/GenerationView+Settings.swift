@@ -14,7 +14,7 @@ extension GenerationView {
 
     var typeTabs: some View {
         HStack(spacing: 0) {
-            ForEach(GenerationType.allCases, id: \.self) { type in
+            ForEach(availableGenerationTypes, id: \.self) { type in
                 Button {
                     withAnimation(.easeInOut(duration: AppTheme.Anim.hover)) { selectedType = type }
                 } label: {
@@ -51,18 +51,24 @@ extension GenerationView {
             switch selectedType {
             case .video:
                 ForEach(enabledVideoModels, id: \.index) { item in
-                    Button(item.model.displayName) { selectedVideoModelIndex = item.index }
+                    Button(modelMenuLabel(item.model.displayName, entry: item.model.entry)) {
+                        selectedVideoModelIndex = item.index
+                    }
                 }
             case .image:
                 ForEach(enabledImageModels, id: \.index) { item in
-                    Button(item.model.displayName) { selectedImageModelIndex = item.index }
+                    Button(modelMenuLabel(item.model.displayName, entry: item.model.entry)) {
+                        selectedImageModelIndex = item.index
+                    }
                 }
             case .audio:
                 ForEach(AudioModelConfig.Category.allCases, id: \.self) { category in
                     if let items = enabledAudioModelsByCategory[category], !items.isEmpty {
                         Section(category.label) {
                             ForEach(items, id: \.index) { item in
-                                Button(item.model.displayName) { selectedAudioModelIndex = item.index }
+                                Button(modelMenuLabel(item.model.displayName, entry: item.model.entry)) {
+                                    selectedAudioModelIndex = item.index
+                                }
                             }
                         }
                     }
@@ -91,6 +97,14 @@ extension GenerationView {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .hoverHighlight()
+    }
+
+    private func modelMenuLabel(_ displayName: String, entry: CatalogEntry) -> String {
+        guard let profileID = entry.providerProfileID,
+              let providerName = AIProviderStore.shared.profile(id: profileID)?.name else {
+            return displayName
+        }
+        return "\(displayName) — \(providerName)"
     }
 
     var voicePicker: some View {

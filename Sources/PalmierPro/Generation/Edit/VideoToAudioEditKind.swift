@@ -62,16 +62,20 @@ enum VideoToAudioEditKind {
 
     @MainActor
     var model: AudioModelConfig? {
-        if let preferred = AudioModelConfig.allModels.first(where: {
-            $0.id == preferredModelId && $0.category == category && $0.inputs.contains(.video)
-        }) {
-            return preferred
-        }
-        return AudioModelConfig.allModels.first {
+        let candidates = AudioModelConfig.allModels.filter {
             $0.category == category
                 && $0.inputs.contains(.video)
-                && ($0.id.localizedCaseInsensitiveContains(providerName)
-                    || $0.displayName.localizedCaseInsensitiveContains(providerName))
+                && GenerationAccessPolicy.isAvailable(modelID: $0.id, paidOnly: $0.paidOnly)
         }
+        if let preferred = candidates.first(where: { $0.id == preferredModelId }) {
+            return preferred
+        }
+        if let named = candidates.first(where: {
+            $0.id.localizedCaseInsensitiveContains(providerName)
+                || $0.displayName.localizedCaseInsensitiveContains(providerName)
+        }) {
+            return named
+        }
+        return candidates.first
     }
 }

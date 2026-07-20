@@ -7,6 +7,15 @@ enum ModelKind: Sendable {
     case image(ImageModelConfig)
     case audio(AudioModelConfig)
     case upscale(UpscaleModelConfig)
+
+    var entry: CatalogEntry {
+        switch self {
+        case .video(let model): model.entry
+        case .image(let model): model.entry
+        case .audio(let model): model.entry
+        case .upscale(let model): model.entry
+        }
+    }
 }
 
 enum ModelRegistry {
@@ -14,6 +23,7 @@ enum ModelRegistry {
 
     @MainActor static func exists(id: String) -> Bool { byId[id] != nil }
 
+    @MainActor static func entry(for id: String) -> CatalogEntry? { byId[id]?.entry }
 
     @MainActor static func displayName(for id: String) -> String {
         switch byId[id] {
@@ -40,20 +50,41 @@ final class ModelCatalog {
     private(set) var lastError: String?
 
     @ObservationIgnored private var subscription: AnyCancellable?
+    @ObservationIgnored private var providerObserver: NSObjectProtocol?
     @ObservationIgnored private var didConfigure = false
     @ObservationIgnored private var retryTask: Task<Void, Never>?
     @ObservationIgnored private var failureCount = 0
+    @ObservationIgnored private var managedEntries: [CatalogEntry] = []
+    @ObservationIgnored private var externalEntries: [CatalogEntry] = []
+    @ObservationIgnored private var managedLoaded = false
+    @ObservationIgnored private var externalLoaded = false
+    @ObservationIgnored private var managedError: String?
+    @ObservationIgnored private var externalError: String?
 
     private init() {}
 
     func configure() {
         guard !didConfigure else { return }
         didConfigure = true
+        providerObserver = NotificationCenter.default.addObserver(
+            forName: .aiProviderConfigurationDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                await self?.reloadExternalProviders()
+            }
+        }
         startSubscription()
+        Task { await reloadExternalProviders() }
     }
 
     private func startSubscription() {
-        guard let client = AccountService.shared.convex else { return }
+        guard let client = AccountService.shared.convex else {
+            managedLoaded = true
+            rebuildCatalog()
+            return
+        }
 
         subscription = client
             .subscribe(to: "models:list", yielding: [CatalogEntry].self)
@@ -65,16 +96,20 @@ final class ModelCatalog {
                     }
                 },
                 receiveValue: { [weak self] entries in
-                    self?.failureCount = 0
-                    self?.apply(entries)
+                    guard let self else { return }
+                    self.failureCount = 0
+                    self.managedEntries = entries
+                    self.managedLoaded = true
+                    self.managedError = nil
+                    self.rebuildCatalog()
                 }
             )
     }
 
     private func handleFailure(_ err: ClientError) {
         failureCount += 1
-        lastError = err.localizedDescription
-        // First failure goes to Sentry; retries only log locally.
+        managedError = err.localizedDescription
+        rebuildCatalog()
         if failureCount == 1 {
             Log.generation.error("ModelCatalog subscription failed: \(err.localizedDescription)")
         } else {
@@ -89,7 +124,55 @@ final class ModelCatalog {
         }
     }
 
-    private func apply(_ entries: [CatalogEntry]) {
+    func reloadExternalProviders() async {
+        var entries: [CatalogEntry] = []
+        var errors: [String] = []
+
+        for profile in AIProviderStore.shared.generationProfiles where !profile.isManagedPalmier {
+            guard let configuration = profile.generation else { continue }
+            do {
+                switch configuration.providerKind {
+                case .falQueue:
+                    entries.append(contentsOf: FalGenerationCatalog.entries(profile: profile))
+                case .openAIMedia:
+                    entries.append(contentsOf: OpenAIMediaGenerationCatalog.entries(profile: profile))
+                case .compatibleV1:
+                    let runtime: AIProviderRuntimeProfile
+                    if case .array? = configuration.options["models"] {
+                        let publicHeaders: [String: String] = Dictionary(
+                            uniqueKeysWithValues: profile.headers.compactMap { header -> (String, String)? in
+                                guard !header.isSecret, let value = header.value else { return nil }
+                                return (header.name, value)
+                            }
+                        )
+                        runtime = AIProviderRuntimeProfile(
+                            profile: profile,
+                            primaryCredential: nil,
+                            headers: publicHeaders
+                        )
+                    } else {
+                        runtime = try await AIProviderStore.shared.runtimeProfile(id: profile.id)
+                    }
+                    entries.append(contentsOf: try await CompatibleGenerationCatalog.entries(
+                        runtimeProfile: runtime
+                    ))
+                case .palmierManaged:
+                    break
+                }
+            } catch {
+                errors.append("\(profile.name): \(error.localizedDescription)")
+            }
+        }
+
+        externalEntries = entries
+        externalLoaded = true
+        externalError = errors.isEmpty ? nil : errors.joined(separator: "\n")
+        rebuildCatalog()
+    }
+
+    private func rebuildCatalog() {
+        var seen = Set<String>()
+        let entries = (managedEntries + externalEntries).filter { seen.insert($0.id).inserted }
         var newVideo: [VideoModelConfig] = []
         var newImage: [ImageModelConfig] = []
         var newAudio: [AudioModelConfig] = []
@@ -104,31 +187,32 @@ final class ModelCatalog {
         for entry in entries {
             switch entry.uiCapabilities {
             case .video(let caps):
-                let m = VideoModelConfig(entry: entry, caps: caps)
-                newVideo.append(m)
-                newById[m.id] = .video(m)
+                let model = VideoModelConfig(entry: entry, caps: caps)
+                newVideo.append(model)
+                newById[model.id] = .video(model)
             case .image(let caps):
-                let m = ImageModelConfig(entry: entry, caps: caps)
-                newImage.append(m)
-                newById[m.id] = .image(m)
+                let model = ImageModelConfig(entry: entry, caps: caps)
+                newImage.append(model)
+                newById[model.id] = .image(model)
             case .audio(let caps):
-                let m = AudioModelConfig(entry: entry, caps: caps)
-                newAudio.append(m)
-                newById[m.id] = .audio(m)
+                let model = AudioModelConfig(entry: entry, caps: caps)
+                newAudio.append(model)
+                newById[model.id] = .audio(model)
             case .upscale(let caps):
-                let m = UpscaleModelConfig(entry: entry, caps: caps)
-                newUpscale.append(m)
-                newById[m.id] = .upscale(m)
+                let model = UpscaleModelConfig(entry: entry, caps: caps)
+                newUpscale.append(model)
+                newById[model.id] = .upscale(model)
             }
         }
 
-        self.video = newVideo
-        self.image = newImage
-        self.audio = newAudio
-        self.upscale = newUpscale
-        self.byId = newById
-        self.isLoaded = true
-        self.lastError = nil
+        video = newVideo
+        image = newImage
+        audio = newAudio
+        upscale = newUpscale
+        byId = newById
+        isLoaded = managedLoaded || externalLoaded
+        lastError = [managedError, externalError].compactMap { $0 }.joined(separator: "\n")
+        if lastError?.isEmpty == true { lastError = nil }
     }
 }
 
@@ -146,6 +230,9 @@ struct CatalogEntry: Decodable, Sendable {
     let audioPricing: AudioPricing?
     let creditsPerSecondUpscale: Double?
     let paidOnly: Bool
+    let providerProfileID: UUID?
+    let providerKind: GenerationProviderKind?
+    let providerModelID: String?
 
     enum Kind: String, Decodable, Sendable { case video, image, audio, upscale }
     enum ResponseShape: String, Decodable, Sendable {
@@ -184,6 +271,42 @@ struct CatalogEntry: Decodable, Sendable {
         }
     }
 
+    init(
+        id: String,
+        providerProfileID: UUID,
+        providerKind: GenerationProviderKind,
+        providerModelID: String,
+        kind: Kind,
+        displayName: String,
+        responseShape: ResponseShape,
+        uiCapabilities: UICapabilities,
+        allowedEndpoints: [String] = [],
+        creditsPerSecond: [String: Double]? = nil,
+        audioDiscountRate: [String: Double]? = nil,
+        creditsPerImage: [String: Double]? = nil,
+        qualities: [String]? = nil,
+        audioPricing: AudioPricing? = nil,
+        creditsPerSecondUpscale: Double? = nil,
+        paidOnly: Bool = false
+    ) {
+        self.id = id
+        self.kind = kind
+        self.displayName = displayName
+        self.allowedEndpoints = allowedEndpoints
+        self.responseShape = responseShape
+        self.uiCapabilities = uiCapabilities
+        self.creditsPerSecond = creditsPerSecond
+        self.audioDiscountRate = audioDiscountRate
+        self.creditsPerImage = creditsPerImage
+        self.qualities = qualities
+        self.audioPricing = audioPricing
+        self.creditsPerSecondUpscale = creditsPerSecondUpscale
+        self.paidOnly = paidOnly
+        self.providerProfileID = providerProfileID
+        self.providerKind = providerKind
+        self.providerModelID = providerModelID
+    }
+
     private enum CodingKeys: String, CodingKey {
         case id, kind, displayName, allowedEndpoints, responseShape, uiCapabilities
         case creditsPerSecond, audioDiscountRate, creditsPerImage, qualities
@@ -204,6 +327,9 @@ struct CatalogEntry: Decodable, Sendable {
         self.audioPricing = try c.decodeIfPresent(AudioPricing.self, forKey: .audioPricing)
         self.creditsPerSecondUpscale = try c.decodeIfPresent(Double.self, forKey: .creditsPerSecondUpscale)
         self.paidOnly = try c.decodeIfPresent(Bool.self, forKey: .paidOnly) ?? false
+        self.providerProfileID = AIProviderProfile.palmierManagedID
+        self.providerKind = .palmierManaged
+        self.providerModelID = self.id
         switch self.kind {
         case .video:
             self.uiCapabilities = .video(try c.decode(VideoCaps.self, forKey: .uiCapabilities))

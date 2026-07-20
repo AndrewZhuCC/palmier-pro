@@ -1,5 +1,5 @@
 {
-  "originHash" : "49e7dc015b69f5cdaaa4a448098311c115104c2a4324fd27fa249739ab9b5b3b",
+  "originHash" : "5157cd190eecb218e91846bd676de6fe8f72f5ff53460f6f7733ea7f462fee03",
   "pins" : [
     {
       "identity" : "clerk-convex-swift",
@@ -35,6 +35,15 @@
       "state" : {
         "revision" : "a3a85a85214caf642abaa96ae664e4c772a59f6e",
         "version" : "1.4.1"
+      }
+    },
+    {
+      "identity" : "fal-swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/fal-ai/fal-swift",
+      "state" : {
+        "revision" : "a58ca8a926a56a69ba3c454583f626b3629a4223",
+        "version" : "0.5.6"
       }
     },
     {
@@ -134,6 +143,15 @@
       "state" : {
         "revision" : "5073617dac96330a486245e4c0179cb0a6fd2256",
         "version" : "1.12.0"
+      }
+    },
+    {
+      "identity" : "swift-msgpack",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/nnabeyang/swift-msgpack.git",
+      "state" : {
+        "revision" : "1c8dbd506c68888df3fd5df4ff56cef9cb39c388",
+        "version" : "0.7.0"
       }
     },
     {

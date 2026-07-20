@@ -6,6 +6,7 @@ Analytics.start()
 Analytics.capture(.appOpened)
 BundledFonts.register()
 AccountService.shared.configure()
+AIProviderStore.shared.configure()
 ModelCatalog.shared.configure()
 
 // Shorten the default tooltip delay from 2s to 0.01s.
