@@ -16,6 +16,8 @@ final class ToolExecutor {
     private var mcpClientInfo: MCPClientInfo?
     private(set) var mcpSessionActivation = Analytics.SessionActivation()
     let exportQueue: ExportQueue
+    let providerStore: AIProviderStore
+    var providerCredentialPrompter: (any AIProviderCredentialPrompting)?
 
     var editor: EditorViewModel? {
         frontmostProjectProvider == nil ? inAppEditor : sessionProject?.editorViewModel
@@ -30,18 +32,32 @@ final class ToolExecutor {
 
     var frontmostProject: VideoProject? { frontmostProjectProvider?() }
 
-    init(editor: EditorViewModel, exportQueue: ExportQueue = .shared) {
+    init(
+        editor: EditorViewModel,
+        exportQueue: ExportQueue = .shared,
+        providerStore: AIProviderStore = .shared,
+        providerCredentialPrompter: (any AIProviderCredentialPrompting)? = nil
+    ) {
         self.inAppEditor = editor
         self.frontmostProjectProvider = nil
         self.exportQueue = exportQueue
+        self.providerStore = providerStore
+        self.providerCredentialPrompter = providerCredentialPrompter
     }
 
-    init(projectProvider: @escaping () -> VideoProject?, exportQueue: ExportQueue = .shared) {
+    init(
+        projectProvider: @escaping () -> VideoProject?,
+        exportQueue: ExportQueue = .shared,
+        providerStore: AIProviderStore = .shared,
+        providerCredentialPrompter: (any AIProviderCredentialPrompting)? = nil
+    ) {
         let project = projectProvider()
         self.inAppEditor = nil
         self.frontmostProjectProvider = projectProvider
         self.boundProject = project
         self.exportQueue = exportQueue
+        self.providerStore = providerStore
+        self.providerCredentialPrompter = providerCredentialPrompter
     }
 
     func bindProject(_ project: VideoProject?) {
@@ -51,6 +67,10 @@ final class ToolExecutor {
 
     func setMCPClientInfo(_ clientInfo: MCPClientInfo) {
         mcpClientInfo = clientInfo
+    }
+
+    func setProviderCredentialPrompter(_ prompter: any AIProviderCredentialPrompting) {
+        providerCredentialPrompter = prompter
     }
 
     var feedbackState = FeedbackState()
@@ -71,10 +91,20 @@ final class ToolExecutor {
         }
         activateMCPSessionIfNeeded(source: source, toolName: tool.rawValue)
 
-        // project tools act on AppState before editor is available
+        // Application-level tools act before an editor is available.
         switch tool {
         case .manageProject:
             let result = await manageProject(args)
+            captureToolAnalytics(
+                toolName: tool.rawValue,
+                source: source,
+                projectId: editor?.projectId,
+                status: result.isError ? "failed" : "finished",
+                started: started
+            )
+            return result
+        case .manageAIProviders:
+            let result = await manageAIProviders(args)
             captureToolAnalytics(
                 toolName: tool.rawValue,
                 source: source,
@@ -269,6 +299,8 @@ final class ToolExecutor {
         case .readSkill:     return readSkill(args)
         case .manageProject:
             return await manageProject(args)
+        case .manageAIProviders:
+            return await manageAIProviders(args)
         }
     }
 

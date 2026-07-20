@@ -176,6 +176,39 @@ final class AIProviderStore {
         profile.isManagedPalmier || credentialProfileIDs.contains(profile.id)
     }
 
+    func credentialState(for profile: AIProviderProfile) async throws -> AIProviderCredentialState {
+        if profile.isManagedPalmier {
+            return AIProviderCredentialState(
+                primaryRequired: false,
+                primaryPresent: true,
+                secretHeaderPresence: [:]
+            )
+        }
+
+        let primaryPresent: Bool
+        if profile.requiresPrimaryCredential {
+            let value = try await credentials.primaryCredential(for: profile.id)
+            primaryPresent = Self.isCredentialPresent(value)
+        } else {
+            primaryPresent = true
+        }
+
+        var secretHeaderPresence: [UUID: Bool] = [:]
+        for header in profile.headers where header.isSecret {
+            let value = try await credentials.secretHeaderValue(
+                profileID: profile.id,
+                headerID: header.id
+            )
+            secretHeaderPresence[header.id] = Self.isCredentialPresent(value)
+        }
+
+        return AIProviderCredentialState(
+            primaryRequired: profile.requiresPrimaryCredential,
+            primaryPresent: primaryPresent,
+            secretHeaderPresence: secretHeaderPresence
+        )
+    }
+
     func saveProfile(
         _ rawProfile: AIProviderProfile,
         primaryCredential: String? = nil,
@@ -414,28 +447,15 @@ final class AIProviderStore {
     private func credentialIDs(in profiles: [AIProviderProfile]) async throws -> Set<UUID> {
         var result = Set<UUID>()
         for profile in profiles {
-            var isReady = true
-            if profile.requiresPrimaryCredential {
-                let credential = try await credentials.primaryCredential(for: profile.id)
-                isReady = credential?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            }
-            if isReady {
-                for header in profile.headers where header.isSecret {
-                    let value = try await credentials.secretHeaderValue(
-                        profileID: profile.id,
-                        headerID: header.id
-                    )
-                    if value?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
-                        isReady = false
-                        break
-                    }
-                }
-            }
-            if isReady {
+            if try await credentialState(for: profile).isReady {
                 result.insert(profile.id)
             }
         }
         return result
+    }
+
+    private static func isCredentialPresent(_ value: String?) -> Bool {
+        value?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     }
 
     private func snapshot(

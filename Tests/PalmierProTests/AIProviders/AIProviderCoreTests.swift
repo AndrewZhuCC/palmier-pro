@@ -546,7 +546,7 @@ struct AIProviderStoreTests {
     }
 }
 
-private actor MemoryProviderRepository: AIProviderConfigurationPersisting {
+actor MemoryProviderRepository: AIProviderConfigurationPersisting {
     private var snapshot: AIProviderConfigurationSnapshot
 
     init(snapshot: AIProviderConfigurationSnapshot = AIProviderConfigurationSnapshot()) {
@@ -562,7 +562,7 @@ private actor MemoryProviderRepository: AIProviderConfigurationPersisting {
     func currentSnapshot() -> AIProviderConfigurationSnapshot { snapshot }
 }
 
-private actor FailingSaveProviderRepository: AIProviderConfigurationPersisting {
+actor FailingSaveProviderRepository: AIProviderConfigurationPersisting {
     private let snapshot: AIProviderConfigurationSnapshot
 
     init(snapshot: AIProviderConfigurationSnapshot) {
@@ -577,7 +577,7 @@ private actor FailingSaveProviderRepository: AIProviderConfigurationPersisting {
     }
 }
 
-private actor MemoryCredentialStore: AIProviderCredentialStoring {
+actor MemoryCredentialStore: AIProviderCredentialStoring {
     private var primaryValues: [UUID: String] = [:]
     private var headerValues: [String: String] = [:]
     private var legacyValue: String?
@@ -591,7 +591,11 @@ private actor MemoryCredentialStore: AIProviderCredentialStoring {
     }
 
     func setPrimaryCredential(_ value: String?, for profileID: UUID) {
-        primaryValues[profileID] = value
+        if let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            primaryValues[profileID] = value
+        } else {
+            primaryValues.removeValue(forKey: profileID)
+        }
     }
 
     func secretHeaderValue(profileID: UUID, headerID: UUID) -> String? {
@@ -599,7 +603,12 @@ private actor MemoryCredentialStore: AIProviderCredentialStoring {
     }
 
     func setSecretHeaderValue(_ value: String?, profileID: UUID, headerID: UUID) {
-        headerValues[key(profileID: profileID, headerID: headerID)] = value
+        let storageKey = key(profileID: profileID, headerID: headerID)
+        if let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            headerValues[storageKey] = value
+        } else {
+            headerValues.removeValue(forKey: storageKey)
+        }
     }
 
     func removeCredentials(profileID: UUID, headerIDs: [UUID]) {

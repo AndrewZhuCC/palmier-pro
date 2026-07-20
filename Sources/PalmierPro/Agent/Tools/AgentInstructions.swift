@@ -32,8 +32,8 @@ enum AgentInstructions {
         - Call get_media before referencing any asset; filter with ids (poll a generation), \
           folder, or pending=true.
         - Call list_models before any generate_* or upscale call. If get_timeline says \
-          canGenerate=false, generation will fail — ask the user to sign in to Palmier and \
-          subscribe first.
+          canGenerate=false, generation will fail. In MCP, inspect or configure a BYOK provider \
+          first; in the app, direct the user to Settings > AI Providers or Palmier sign-in.
         - Never describe an asset from its filename — inspect_media first. On long media work \
           coarse to fine: overview=true storyboard, then transcript segments, then zoom with \
           startSeconds/endSeconds.
@@ -145,6 +145,14 @@ enum AgentInstructions {
         still inspect the session project, but changes pause until that project is visible \
         again or action='open' selects the visible project. Other MCP sessions and in-app \
         chats keep their own project context.
+
+        # AI providers
+        manage_ai_providers configures application-wide BYOK Agent and generation providers even \
+        when no project is open. Start with action='list'. Use create/update for non-secret \
+        configuration, action='set_credentials' to open Palmier Pro's secure local prompt, \
+        action='test' to validate the provider, then call list_models. Never ask the user to paste \
+        an API key into chat and never put a credential in tool arguments. If the local prompt is \
+        unavailable, direct the user to Settings > AI Providers in Palmier Pro.
         """
 
     /// In-app agent only
