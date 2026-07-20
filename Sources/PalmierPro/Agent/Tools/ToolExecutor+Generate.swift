@@ -2,36 +2,32 @@ import AVFoundation
 import Foundation
 
 extension ToolExecutor {
-    private var canUsePaidModels: Bool { AccountService.shared.isPaid }
-    private func modelAvailable(paidOnly: Bool) -> Bool { canUsePaidModels || !paidOnly }
-
-    private func requirePlan(for modelId: String, paidOnly: Bool) throws {
-        if paidOnly && !canUsePaidModels {
-            throw ToolError(
-                "Model '\(modelId)' requires a paid plan. Pick a free model from list_models, "
-                + "or tell the user to subscribe."
-            )
+    private func requireGenerationAccess(for modelID: String, paidOnly: Bool) throws {
+        do {
+            try GenerationAccessPolicy.validate(modelID: modelID, paidOnly: paidOnly)
+        } catch {
+            throw ToolError(error.localizedDescription)
         }
+    }
+
+    private func modelAvailable(modelID: String, paidOnly: Bool) -> Bool {
+        GenerationAccessPolicy.isAvailable(modelID: modelID, paidOnly: paidOnly)
     }
 
     private func defaultModelId(_ ids: [(id: String, paidOnly: Bool)], kind: String) throws -> String {
         guard !ids.isEmpty else {
             throw ToolError("Model catalog not loaded yet. Try again in a moment.")
         }
-        guard let match = ids.first(where: { modelAvailable(paidOnly: $0.paidOnly) }) else {
-            throw ToolError("No \(kind) model is available on the current plan. Tell the user to subscribe.")
+        guard let match = ids.first(where: {
+            modelAvailable(modelID: $0.id, paidOnly: $0.paidOnly)
+        }) else {
+            throw ToolError("No configured \(kind) provider is ready. Tell the user to check Settings > Providers.")
         }
         return match.id
     }
 
     func generate(_ editor: EditorViewModel, _ args: [String: Any], type: ClipType) throws -> ToolResult {
         let prompt = try args.requireString("prompt")
-        guard AccountService.shared.isSignedIn else {
-            throw ToolError("Generation requires signing in to Palmier. Tell the user to sign in.")
-        }
-        guard AccountService.shared.hasCredits else {
-            throw ToolError("Out of credits. Tell the user to add credits or subscribe to keep generating.")
-        }
         switch type {
         case .sequence:
             throw ToolError("Cannot generate a sequence. Sequences are timelines.")
@@ -41,7 +37,7 @@ extension ToolExecutor {
             guard let model = VideoModelConfig.allModels.first(where: { $0.id == modelId }) else {
                 throw ToolError("Unknown model '\(modelId)'. Available: \(VideoModelConfig.allModels.map(\.id).joined(separator: ", "))")
             }
-            try requirePlan(for: model.id, paidOnly: model.paidOnly)
+            try requireGenerationAccess(for: model.id, paidOnly: model.paidOnly)
             return model.requiresSourceVideo
                 ? try generateVideoEdit(editor, args, prompt: prompt, model: model)
                 : try generateVideoText(editor, args, prompt: prompt, model: model)
@@ -181,7 +177,7 @@ extension ToolExecutor {
         guard let model = ImageModelConfig.allModels.first(where: { $0.id == modelId }) else {
             throw ToolError("Unknown model '\(modelId)'. Available: \(ImageModelConfig.allModels.map(\.id).joined(separator: ", "))")
         }
-        try requirePlan(for: model.id, paidOnly: model.paidOnly)
+        try requireGenerationAccess(for: model.id, paidOnly: model.paidOnly)
         let aspectRatio = args.string("aspectRatio") ?? model.aspectRatios.first ?? ""
         let resolution = args.string("resolution") ?? model.resolutions?.first
         let quality = args.string("quality") ?? model.qualities?.last
@@ -220,18 +216,12 @@ extension ToolExecutor {
     }
 
     func generateAudio(_ editor: EditorViewModel, _ args: [String: Any]) async throws -> ToolResult {
-        guard AccountService.shared.isSignedIn else {
-            throw ToolError("Generation requires signing in to Palmier. Tell the user to sign in.")
-        }
-        guard AccountService.shared.hasCredits else {
-            throw ToolError("Out of credits. Tell the user to add credits or subscribe to keep generating.")
-        }
         let modelId = try args.string("model") ?? defaultModelId(
             AudioModelConfig.allModels.map { (id: $0.id, paidOnly: $0.paidOnly) }, kind: "audio")
         guard let model = AudioModelConfig.allModels.first(where: { $0.id == modelId }) else {
             throw ToolError("Unknown model '\(modelId)'. Available: \(AudioModelConfig.allModels.map(\.id).joined(separator: ", "))")
         }
-        try requirePlan(for: model.id, paidOnly: model.paidOnly)
+        try requireGenerationAccess(for: model.id, paidOnly: model.paidOnly)
 
         let prompt = (args.string("prompt") ?? "").trimmingCharacters(in: .whitespaces)
         let acceptsVideo = model.inputs.contains(.video)
@@ -278,8 +268,17 @@ extension ToolExecutor {
                 shortSide: 240, includeAudio: false,
                 preset: AVAssetExportPresetLowQuality
             )
-            defer { try? FileManager.default.removeItem(at: mp4) }
-            videoURL = try await GenerationBackend.uploadReference(fileURL: mp4, contentType: "video/mp4")
+            do {
+                videoURL = try await editor.generationService.uploadReference(
+                    modelID: model.id,
+                    fileURL: mp4,
+                    contentType: "video/mp4"
+                )
+                await Self.removeTemporaryFile(mp4)
+            } catch {
+                await Self.removeTemporaryFile(mp4)
+                throw error
+            }
             spanSeconds = Double(end - start) / Double(max(1, editor.timeline.fps))
             placementStartFrame = start
         }
@@ -373,13 +372,6 @@ extension ToolExecutor {
         guard asset.type == .video || asset.type == .image else {
             throw ToolError("Upscale supports video and image assets only (got \(asset.type.rawValue))")
         }
-        guard AccountService.shared.isSignedIn else {
-            throw ToolError("Upscale requires signing in to Palmier. Tell the user to sign in.")
-        }
-        guard AccountService.shared.hasCredits else {
-            throw ToolError("Out of credits. Tell the user to add credits or subscribe to keep generating.")
-        }
-
         let available = UpscaleModelConfig.models(for: asset.type)
         let model: UpscaleModelConfig
         if let requested = args.string("model") {
@@ -387,11 +379,13 @@ extension ToolExecutor {
                 let ids = available.map(\.id).joined(separator: ", ")
                 throw ToolError("Model '\(requested)' does not support \(asset.type.rawValue). Available: \(ids)")
             }
-            try requirePlan(for: match.id, paidOnly: match.paidOnly)
+            try requireGenerationAccess(for: match.id, paidOnly: match.paidOnly)
             model = match
         } else {
-            guard let first = available.first(where: { modelAvailable(paidOnly: $0.paidOnly) }) else {
-                throw ToolError("No upscaler available for \(asset.type.rawValue) on the current plan.")
+            guard let first = available.first(where: {
+                modelAvailable(modelID: $0.id, paidOnly: $0.paidOnly)
+            }) else {
+                throw ToolError("No configured upscaler is ready for \(asset.type.rawValue).")
             }
             model = first
         }
@@ -433,22 +427,22 @@ extension ToolExecutor {
         var out: [[String: Any]] = []
         if filter == nil || filter == "video" {
             out += VideoModelConfig.allModels
-                .filter { modelAvailable(paidOnly: $0.paidOnly) }
+                .filter { modelAvailable(modelID: $0.id, paidOnly: $0.paidOnly) }
                 .map { Self.videoModelInfo($0, includeType: true) }
         }
         if filter == nil || filter == "image" {
             out += ImageModelConfig.allModels
-                .filter { modelAvailable(paidOnly: $0.paidOnly) }
+                .filter { modelAvailable(modelID: $0.id, paidOnly: $0.paidOnly) }
                 .map { Self.imageModelInfo($0, includeType: true) }
         }
         if filter == nil || filter == "audio" {
             out += AudioModelConfig.allModels
-                .filter { modelAvailable(paidOnly: $0.paidOnly) }
+                .filter { modelAvailable(modelID: $0.id, paidOnly: $0.paidOnly) }
                 .map { Self.audioModelInfo($0) }
         }
         if filter == nil || filter == "upscale" {
             out += UpscaleModelConfig.allModels
-                .filter { modelAvailable(paidOnly: $0.paidOnly) }
+                .filter { modelAvailable(modelID: $0.id, paidOnly: $0.paidOnly) }
                 .map { Self.upscaleModelInfo($0) }
         }
         let body: [String: Any] = [
@@ -461,7 +455,7 @@ extension ToolExecutor {
         return .ok(json)
     }
 
-    nonisolated static func videoModelInfo(_ m: VideoModelConfig, includeType: Bool = false) -> [String: Any] {
+    static func videoModelInfo(_ m: VideoModelConfig, includeType: Bool = false) -> [String: Any] {
         var info: [String: Any] = [
             "id": m.id, "displayName": m.displayName,
             "durations": m.durations, "aspectRatios": m.aspectRatios,
@@ -470,6 +464,7 @@ extension ToolExecutor {
             "supportsReferences": m.supportsReferences,
         ]
         if includeType { info["type"] = "video" }
+        addProviderInfo(m.entry, to: &info)
         if let r = m.resolutions { info["resolutions"] = r }
         if m.supportsReferences {
             if m.maxReferenceImages > 0 { info["maxReferenceImages"] = m.maxReferenceImages }
@@ -484,19 +479,20 @@ extension ToolExecutor {
         return info
     }
 
-    nonisolated static func imageModelInfo(_ m: ImageModelConfig, includeType: Bool = false) -> [String: Any] {
+    static func imageModelInfo(_ m: ImageModelConfig, includeType: Bool = false) -> [String: Any] {
         var info: [String: Any] = [
             "id": m.id, "displayName": m.displayName,
             "aspectRatios": m.aspectRatios,
             "supportsImageReference": m.supportsImageReference,
         ]
         if includeType { info["type"] = "image" }
+        addProviderInfo(m.entry, to: &info)
         if let r = m.resolutions { info["resolutions"] = r }
         if let q = m.qualities { info["qualities"] = q }
         return info
     }
 
-    nonisolated static func audioModelInfo(_ m: AudioModelConfig) -> [String: Any] {
+    static func audioModelInfo(_ m: AudioModelConfig) -> [String: Any] {
         var info: [String: Any] = [
             "id": m.id, "displayName": m.displayName,
             "type": "audio",
@@ -507,6 +503,7 @@ extension ToolExecutor {
             "supportsInstrumental": m.supportsInstrumental,
             "supportsStyleInstructions": m.supportsStyleInstructions,
         ]
+        addProviderInfo(m.entry, to: &info)
         if let voices = m.voices {
             info["voicesSample"] = Array(voices.prefix(3))
             info["voiceCount"] = voices.count
@@ -523,12 +520,34 @@ extension ToolExecutor {
         return info
     }
 
-    nonisolated static func upscaleModelInfo(_ m: UpscaleModelConfig) -> [String: Any] {
-        [
+    static func upscaleModelInfo(_ m: UpscaleModelConfig) -> [String: Any] {
+        var info: [String: Any] = [
             "id": m.id, "displayName": m.displayName,
             "type": "upscale",
             "speed": m.speed,
             "supportedTypes": m.supportedTypes.map(\.rawValue).sorted(),
         ]
+        addProviderInfo(m.entry, to: &info)
+        return info
+    }
+
+    nonisolated private static func removeTemporaryFile(_ url: URL) async {
+        await Task.detached(priority: .utility) {
+            try? FileManager.default.removeItem(at: url)
+        }.value
+    }
+
+    private static func addProviderInfo(
+        _ entry: CatalogEntry,
+        to info: inout [String: Any]
+    ) {
+        if let kind = entry.providerKind { info["providerKind"] = kind.rawValue }
+        if let profileID = entry.providerProfileID {
+            info["providerProfileID"] = profileID.uuidString
+            if let profile = AIProviderStore.shared.profile(id: profileID) {
+                info["providerName"] = profile.name
+            }
+        }
+        if let modelID = entry.providerModelID { info["providerModelID"] = modelID }
     }
 }

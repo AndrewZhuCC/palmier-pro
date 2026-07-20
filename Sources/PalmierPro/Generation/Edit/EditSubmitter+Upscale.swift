@@ -10,7 +10,10 @@ extension EditSubmitter {
         onComplete: (@MainActor (MediaAsset) -> Void)? = nil,
         onFailure: (@MainActor () -> Void)? = nil
     ) -> String? {
-        guard AccountService.shared.isSignedIn else { return nil }
+        guard GenerationAccessPolicy.isAvailable(
+            modelID: model.id,
+            paidOnly: model.paidOnly
+        ) else { return nil }
 
         let effectiveDuration = effectiveDuration(for: asset, trimmedSource: trimmedSource)
         let genInput = GenerationInput(

@@ -131,20 +131,34 @@ struct GenerationView: View {
 
     var body: some View {
         Group {
-            if catalogReady {
+            if catalogReady, availableGenerationTypes.contains(selectedType) {
                 bodyContent
             } else {
                 catalogLoadingView
+                    .onAppear { normalizeModelSelection() }
             }
         }
     }
 
+    @ViewBuilder
     private var catalogLoadingView: some View {
         VStack(spacing: AppTheme.Spacing.md) {
-            ProgressView()
-            Text("Loading models…")
-                .font(.system(size: AppTheme.FontSize.sm))
-                .foregroundStyle(AppTheme.Text.secondaryColor)
+            if ModelCatalog.shared.isLoaded {
+                Image(systemName: "slider.horizontal.3")
+                    .font(.system(size: AppTheme.IconSize.lg))
+                    .foregroundStyle(AppTheme.Text.secondaryColor)
+                Text("No generation models configured")
+                    .font(.system(size: AppTheme.FontSize.sm))
+                    .foregroundStyle(AppTheme.Text.secondaryColor)
+                Button("Open Providers") {
+                    SettingsWindowController.shared.show(tab: .providers)
+                }
+            } else {
+                ProgressView()
+                Text("Loading models…")
+                    .font(.system(size: AppTheme.FontSize.sm))
+                    .foregroundStyle(AppTheme.Text.secondaryColor)
+            }
         }
         .frame(maxWidth: .infinity)
         .frame(height: AppTheme.GenerationPanel.loadingHeight)
@@ -166,7 +180,14 @@ struct GenerationView: View {
             HStack(spacing: AppTheme.Spacing.sm) {
                 typeTabs
                 Spacer()
-                CreditSummaryView(style: .compact)
+                if currentModelUsesPalmier {
+                    CreditSummaryView(style: .compact)
+                } else {
+                    Label(currentGenerationProviderName, systemImage: "key.horizontal")
+                        .font(.system(size: AppTheme.FontSize.xs, weight: .medium))
+                        .foregroundStyle(AppTheme.Text.secondaryColor)
+                        .lineLimit(1)
+                }
                 ProjectActivityButton()
                 Button {
                     editor.pendingEditReplacementClipId = nil

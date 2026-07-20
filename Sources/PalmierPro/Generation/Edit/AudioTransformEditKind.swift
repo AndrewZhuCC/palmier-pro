@@ -36,7 +36,10 @@ enum AudioTransformEditKind: CaseIterable, Equatable {
 
     @MainActor
     var model: AudioModelConfig? {
-        AudioModelConfig.allModels.first { $0.category == category }
+        AudioModelConfig.allModels.first {
+            $0.category == category
+                && GenerationAccessPolicy.isAvailable(modelID: $0.id, paidOnly: $0.paidOnly)
+        }
     }
 
     @MainActor

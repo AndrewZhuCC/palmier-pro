@@ -46,12 +46,18 @@ struct MusicGenerationSubmission {
                 includeAudio: false,
                 preset: AVAssetExportPresetLowQuality
             )
-            defer { try? FileManager.default.removeItem(at: mp4) }
-            onPhase(.uploading)
-            videoURL = try await GenerationBackend.uploadReference(
-                fileURL: mp4,
-                contentType: "video/mp4"
-            )
+            do {
+                onPhase(.uploading)
+                videoURL = try await service.uploadReference(
+                    modelID: model.id,
+                    fileURL: mp4,
+                    contentType: "video/mp4"
+                )
+                await Self.removeTempFile(mp4)
+            } catch {
+                await Self.removeTempFile(mp4)
+                throw error
+            }
         }
 
         let durationSeconds = max(1, Int(spanSeconds.rounded()))
@@ -91,5 +97,11 @@ struct MusicGenerationSubmission {
             placeholderId: placeholderId, startFrame: startFrame, spanSeconds: spanSeconds,
             actionName: "Add Music"
         )
+    }
+
+    private static func removeTempFile(_ url: URL) async {
+        await Task.detached(priority: .utility) {
+            try? FileManager.default.removeItem(at: url)
+        }.value
     }
 }

@@ -29,6 +29,7 @@ extension GenerationView {
 
     /// Live credit estimate for the current form state.
     private var estimatedCost: Int? {
+        guard currentModelUsesPalmier else { return nil }
         switch selectedType {
         case .video:
             return CostEstimator.videoCost(
@@ -56,6 +57,7 @@ extension GenerationView {
     }
 
     private var remainingCredits: Int? {
+        guard currentModelUsesPalmier else { return nil }
         guard let budget = AccountService.shared.budgetCredits else { return nil }
         return max(0, budget - AccountService.shared.spentCredits)
     }
@@ -84,25 +86,38 @@ extension GenerationView {
         return "\(cost) credits. \((left - cost).formatted()) credits remaining after this generation."
     }
 
+    @ViewBuilder
     var costEstimateLabel: some View {
-        HStack(spacing: AppTheme.Spacing.xs) {
-            Image(systemName: "dollarsign.circle.fill")
-                .font(.system(size: AppTheme.FontSize.sm))
-            Text(estimatedCost.map { $0.formatted() } ?? "—")
+        if currentModelUsesPalmier {
+            HStack(spacing: AppTheme.Spacing.xs) {
+                Image(systemName: "dollarsign.circle.fill")
+                    .font(.system(size: AppTheme.FontSize.sm))
+                Text(estimatedCost.map { $0.formatted() } ?? "—")
+                    .font(.system(size: AppTheme.FontSize.xs, weight: .medium))
+                    .monospacedDigit()
+                    .lineLimit(1)
+            }
+            .foregroundStyle(hasInsufficientCredits ? .red : AppTheme.Text.secondaryColor)
+            .help(costHelpText)
+        } else {
+            Label("BYOK", systemImage: "key.horizontal")
                 .font(.system(size: AppTheme.FontSize.xs, weight: .medium))
-                .monospacedDigit()
-                .lineLimit(1)
+                .foregroundStyle(AppTheme.Text.secondaryColor)
+                .help("Usage is billed by \(currentGenerationProviderName).")
         }
-        .foregroundStyle(hasInsufficientCredits ? .red : AppTheme.Text.secondaryColor)
-        .help(costHelpText)
     }
 
     var submitButton: some View {
         Button {
-            if aiAllowed { submitGeneration() }
-            else if !account.isMisconfigured { Task { await account.signInWithGoogle() } }
+            if aiAllowed {
+                submitGeneration()
+            } else if currentModelUsesPalmier, !account.isMisconfigured {
+                Task { await account.signInWithGoogle() }
+            } else {
+                SettingsWindowController.shared.show(tab: .providers)
+            }
         } label: {
-            Image(systemName: aiAllowed ? "arrow.up" : "person.crop.circle")
+            Image(systemName: aiAllowed ? "arrow.up" : (currentModelUsesPalmier ? "person.crop.circle" : "key.horizontal"))
                 .font(.system(size: AppTheme.FontSize.sm, weight: .bold))
                 .frame(width: AppTheme.IconSize.sm, height: AppTheme.IconSize.sm)
         }
@@ -110,9 +125,11 @@ extension GenerationView {
         .buttonBorderShape(.circle)
         .controlSize(.regular)
         .tint(AppTheme.Accent.primary)
-        .disabled(aiAllowed ? !canSubmit : account.isMisconfigured || account.isSigningIn)
-        .opacity((aiAllowed ? canSubmit : !account.isMisconfigured && !account.isSigningIn) ? AppTheme.Opacity.opaque : AppTheme.Opacity.strong)
-        .help(aiAllowed ? "" : (account.isMisconfigured ? "AI is unavailable" : account.isSigningIn ? "Opening Google" : "Sign in to generate"))
+        .disabled(aiAllowed ? !canSubmit : (currentModelUsesPalmier && (account.isMisconfigured || account.isSigningIn)))
+        .opacity((aiAllowed ? canSubmit : (!currentModelUsesPalmier || (!account.isMisconfigured && !account.isSigningIn))) ? AppTheme.Opacity.opaque : AppTheme.Opacity.strong)
+        .help(aiAllowed ? "" : (currentModelUsesPalmier
+            ? (account.isMisconfigured ? "AI is unavailable" : account.isSigningIn ? "Opening Google" : "Sign in to generate")
+            : "Configure credentials for \(currentGenerationProviderName)"))
     }
 
     // MARK: - Actions

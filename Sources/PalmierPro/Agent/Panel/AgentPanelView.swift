@@ -2,6 +2,7 @@ import SwiftUI
 
 struct AgentPanelView: View {
     @Environment(EditorViewModel.self) var editor
+    @Bindable private var providerStore = AIProviderStore.shared
 
     private static let starterPrompts: [AgentStarterPrompt] = [
         AgentStarterPrompt(
@@ -136,12 +137,50 @@ struct AgentPanelView: View {
         }
     }
 
+    private var providerPicker: some View {
+        Menu {
+            ForEach(providerStore.agentProfiles) { profile in
+                Button {
+                    Task {
+                        do {
+                            try await providerStore.setActiveAgentProfile(id: profile.id)
+                        } catch {
+                            service.streamError = .invalidConfiguration(error.localizedDescription)
+                        }
+                    }
+                } label: {
+                    if profile.id == providerStore.activeAgentProfileID {
+                        Label(profile.name, systemImage: "checkmark")
+                    } else {
+                        Text(profile.name)
+                    }
+                }
+            }
+            Divider()
+            Button("Manage AI Providers…") {
+                SettingsWindowController.shared.show(tab: .providers)
+            }
+        } label: {
+            HStack(spacing: AppTheme.Spacing.xs) {
+                Text(service.activeProviderName)
+                    .font(.system(size: AppTheme.FontSize.xs, weight: .medium))
+                    .foregroundStyle(AppTheme.Text.secondaryColor)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: AppTheme.FontSize.micro, weight: .semibold))
+                    .foregroundStyle(AppTheme.Text.tertiaryColor)
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+    }
+
     @ViewBuilder
     private var modelPicker: some View {
-        if service.hasApiKey {
+        if !service.availableModels.isEmpty {
             Menu {
-                ForEach(service.availableModels, id: \.self) { m in
-                    Button(m.displayName) { service.model = m }
+                ForEach(service.availableModels) { model in
+                    Button(model.displayName) { service.selectModel(model.modelID) }
                 }
             } label: {
                 HStack(spacing: AppTheme.Spacing.xs) {
@@ -161,11 +200,11 @@ struct AgentPanelView: View {
 
     @ViewBuilder
     private var byokIndicator: some View {
-        if service.hasApiKey {
-            Text("using API key")
+        if service.isUsingBYOK, let protocolName = service.activeProvider?.agent?.wireProtocol.label {
+            Text(protocolName)
                 .font(.system(size: AppTheme.FontSize.xs).italic())
                 .foregroundStyle(AppTheme.Text.tertiaryColor)
-                .help("Streaming through your Anthropic API key (BYOK)")
+                .help("Streaming through your configured provider credentials")
         }
     }
 
@@ -278,18 +317,23 @@ struct AgentPanelView: View {
         let action: () -> Void
     }
 
-    private func errorCTA(for error: PalmierClientError?) -> ErrorCTA? {
+    private func errorCTA(for error: AIProviderError?) -> ErrorCTA? {
         guard let error else { return nil }
         switch error {
-        case .unauthenticated:
+        case .authenticationRequired where service.activeProvider?.isManagedPalmier == true:
             return ErrorCTA(title: "Sign in") {
                 SettingsWindowController.shared.show(tab: .account)
             }
-        case .insufficientCredits:
+        case .paymentRequired where service.activeProvider?.isManagedPalmier == true:
             return ErrorCTA(title: "View plans") {
                 SettingsWindowController.shared.show(tab: .account)
             }
-        case .upstream:
+        case .missingCredential, .invalidConfiguration, .authenticationRequired:
+            return ErrorCTA(title: "AI Providers") {
+                SettingsWindowController.shared.show(tab: .providers)
+            }
+        case .paymentRequired, .rateLimited, .unsupportedContent, .httpError,
+             .invalidResponse, .streamError, .transport, .cancelled:
             return nil
         }
     }
@@ -317,32 +361,49 @@ struct AgentPanelView: View {
 
     @ViewBuilder
     private var missingKeyState: some View {
-        let account = AccountService.shared
-        VStack(spacing: AppTheme.Spacing.mdLg) {
-            Button {
-                missingKeyPrimaryAction(account: account)
-            } label: {
-                Label(missingKeyPrimaryLabel(account: account), systemImage: missingKeyPrimaryIcon(account: account))
-                    .font(.system(size: AppTheme.FontSize.mdLg, weight: .semibold))
-            }
-            .buttonStyle(.capsule(.prominent, size: .regular))
+        if service.activeProvider?.isManagedPalmier == true {
+            let account = AccountService.shared
+            VStack(spacing: AppTheme.Spacing.mdLg) {
+                Button {
+                    missingKeyPrimaryAction(account: account)
+                } label: {
+                    Label(missingKeyPrimaryLabel(account: account), systemImage: missingKeyPrimaryIcon(account: account))
+                        .font(.system(size: AppTheme.FontSize.mdLg, weight: .semibold))
+                }
+                .buttonStyle(.capsule(.prominent, size: .regular))
 
-            if !account.isSignedIn {
-                Text("First-time sign-ups only")
+                if !account.isSignedIn {
+                    Text("First-time sign-ups only")
+                        .font(.system(size: AppTheme.FontSize.sm))
+                        .foregroundStyle(AppTheme.Text.mutedColor)
+                }
+
+                Button(action: { SettingsWindowController.shared.show(tab: .providers) }) {
+                    Text("or configure your own AI provider")
+                        .underline()
+                        .foregroundStyle(AppTheme.Text.secondaryColor)
+                        .padding(.horizontal, AppTheme.Spacing.sm)
+                        .padding(.vertical, AppTheme.Spacing.xxs)
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: AppTheme.FontSize.smMd, weight: .medium))
+                .hoverHighlight(cornerRadius: AppTheme.Radius.sm)
+            }
+        } else {
+            VStack(spacing: AppTheme.Spacing.smMd) {
+                Button {
+                    SettingsWindowController.shared.show(tab: .providers)
+                } label: {
+                    Label("Configure AI Provider", systemImage: "key.horizontal")
+                        .font(.system(size: AppTheme.FontSize.mdLg, weight: .semibold))
+                }
+                .buttonStyle(.capsule(.prominent, size: .regular))
+
+                Text("Add a key, Base URL, protocol, and model for any compatible AI platform.")
                     .font(.system(size: AppTheme.FontSize.sm))
                     .foregroundStyle(AppTheme.Text.mutedColor)
+                    .multilineTextAlignment(.center)
             }
-
-            Button(action: { SettingsWindowController.shared.show(tab: .agent) }) {
-                Text("or use your own Anthropic key")
-                    .underline()
-                    .foregroundStyle(AppTheme.Text.secondaryColor)
-                    .padding(.horizontal, AppTheme.Spacing.sm)
-                    .padding(.vertical, AppTheme.Spacing.xxs)
-            }
-            .buttonStyle(.plain)
-            .font(.system(size: AppTheme.FontSize.smMd, weight: .medium))
-            .hoverHighlight(cornerRadius: AppTheme.Radius.sm)
         }
     }
 
@@ -392,6 +453,7 @@ struct AgentPanelView: View {
                 onSend: submit,
                 onCancel: { service.cancel() }
             ) {
+                providerPicker
                 modelPicker
                 byokIndicator
             }

@@ -1,6 +1,4 @@
 import Foundation
-@preconcurrency import Combine
-@preconcurrency import ConvexMobile
 
 /// Used by replace-clip callbacks so only the
 /// first successful asset of an N-image generation swaps the clip
@@ -18,11 +16,18 @@ final class FirstOnlyFlag {
 final class GenerationService {
 
     private static let uploadCacheTTL: TimeInterval = 6 * 24 * 60 * 60
-    private var resumedBackendJobIds: Set<String> = []
+    private var resumedGenerationJobs: Set<String> = []
 
     private struct PreparedReferences {
         let uploaded: [String]
         let tempFiles: [URL]
+    }
+
+    private struct ProviderContext {
+        let profileID: UUID
+        let providerKind: GenerationProviderKind
+        let modelID: String
+        let provider: any GenerationProvider
     }
 
     @discardableResult
@@ -73,13 +78,15 @@ final class GenerationService {
 
         Task { @MainActor in
             do {
+                let context = try await self.providerContext(for: genInput)
                 let prepared = try await self.prepareReferences(
                     references: references,
                     trimmedSourceOverride: trimmedSourceOverride,
                     preUploadedURLs: preUploadedURLs,
-                    preprocessRef: preprocessRef
+                    preprocessRef: preprocessRef,
+                    provider: context.provider,
+                    providerProfileID: context.profileID
                 )
-                defer { Self.cleanupTempFiles(prepared.tempFiles) }
                 let uploaded = prepared.uploaded
 
                 var finalGenInput = genInput
@@ -88,6 +95,12 @@ final class GenerationService {
                 } else {
                     finalGenInput.imageURLs = uploaded.isEmpty ? nil : uploaded
                 }
+                Self.scrubTransientReferenceURLs(&finalGenInput)
+                finalGenInput.providerProfileID = context.profileID
+                finalGenInput.providerKind = context.providerKind
+                finalGenInput.providerJob = nil
+                finalGenInput.backendJobId = nil
+                finalGenInput.resultURLs = nil
                 if finalGenInput.createdAt == nil {
                     finalGenInput.createdAt = Date()
                 }
@@ -100,20 +113,22 @@ final class GenerationService {
                 }
 
                 let params = buildParams(uploaded)
+                await Self.cleanupTempFiles(prepared.tempFiles)
 
                 await self.runJob(
                     placeholders: placeholders,
                     params: params,
                     genInput: finalGenInput,
+                    context: context,
                     editor: editor,
                     onComplete: onComplete,
                     onFailure: onFailure
                 )
             } catch {
                 let message = error.localizedDescription
-                Log.generation.error("upload failed model=\(genInput.model) error=\(message)")
+                Log.generation.error("generation preparation failed model=\(genInput.model) error=\(message)")
                 for placeholder in placeholders {
-                    updateGenerationMetadata(placeholder, editor: editor, status: .failed("Upload failed: \(message)"))
+                    updateGenerationMetadata(placeholder, editor: editor, status: .failed(message))
                 }
                 onFailure?()
             }
@@ -122,11 +137,32 @@ final class GenerationService {
         return primaryId
     }
 
+    func uploadReference(
+        modelID: String,
+        fileURL: URL,
+        contentType: String
+    ) async throws -> String {
+        let input = GenerationInput(
+            prompt: "",
+            model: modelID,
+            duration: 0,
+            aspectRatio: "",
+            resolution: nil
+        )
+        let context = try await providerContext(for: input)
+        return try await context.provider.uploadReference(
+            fileURL: fileURL,
+            contentType: contentType
+        )
+    }
+
     private func prepareReferences(
         references: [MediaAsset],
         trimmedSourceOverride: TrimmedSource?,
         preUploadedURLs: [String]?,
-        preprocessRef: (@Sendable (Int, MediaAsset) async throws -> URL?)?
+        preprocessRef: (@Sendable (Int, MediaAsset) async throws -> URL?)?,
+        provider: any GenerationProvider,
+        providerProfileID: UUID
     ) async throws -> PreparedReferences {
         if let preUploadedURLs, !preUploadedURLs.isEmpty {
             return PreparedReferences(uploaded: preUploadedURLs, tempFiles: [])
@@ -158,10 +194,12 @@ final class GenerationService {
                     trimmedFirstReference: trimmedSourceOverride?.hasTrim == true,
                     hasPreprocess: preprocessRef != nil
                 ),
+                provider: provider,
+                providerProfileID: providerProfileID
             )
             return PreparedReferences(uploaded: uploaded, tempFiles: tempFiles)
         } catch {
-            Self.cleanupTempFiles(tempFiles)
+            await Self.cleanupTempFiles(tempFiles)
             throw error
         }
     }
@@ -192,10 +230,62 @@ final class GenerationService {
         }
     }
 
-    private static func cleanupTempFiles(_ urls: [URL]) {
-        for url in urls {
-            try? FileManager.default.removeItem(at: url)
+    private nonisolated static func cleanupTempFiles(_ urls: [URL]) async {
+        guard !urls.isEmpty else { return }
+        await Task.detached(priority: .utility) {
+            for url in urls {
+                do {
+                    try FileManager.default.removeItem(at: url)
+                } catch {
+                    // Best-effort cleanup: the project commit path may already have moved the file.
+                }
+            }
+        }.value
+    }
+
+    /// Resolves provider context for new submissions/uploads from the live model registry only.
+    /// Provider-job resume must not call this; it uses the persisted job handle directly.
+    private func providerContext(for input: GenerationInput) async throws -> ProviderContext {
+        guard let entry = ModelRegistry.entry(for: input.model) else {
+            throw GenerationProviderError.unsupported("model '\(input.model)'")
         }
+        guard let profileID = entry.providerProfileID,
+              let providerKind = entry.providerKind,
+              let providerModelID = entry.providerModelID else {
+            throw GenerationProviderError.unsupported("model '\(input.model)'")
+        }
+        try GenerationAccessPolicy.validate(modelID: input.model, paidOnly: entry.paidOnly)
+
+        guard let profile = AIProviderStore.shared.profile(id: profileID),
+              profile.enabled,
+              let configuration = profile.generation else {
+            throw GenerationProviderError.missingGenerationService
+        }
+        guard providerKind == configuration.providerKind else {
+            throw GenerationProviderError.providerMismatch
+        }
+        if !configuration.modelIDs.isEmpty,
+           !configuration.modelIDs.contains(providerModelID) {
+            throw GenerationProviderError.unsupported("model '\(providerModelID)'")
+        }
+
+        let runtime = try await AIProviderStore.shared.runtimeProfile(id: profileID)
+        let provider = try GenerationProviderFactory.make(runtimeProfile: runtime)
+        return ProviderContext(
+            profileID: profileID,
+            providerKind: providerKind,
+            modelID: providerModelID,
+            provider: provider
+        )
+    }
+
+    /// Uploaded reference URLs may expire or contain signed query credentials.
+    /// Persist stable media asset IDs instead and re-upload on rerun.
+    private static func scrubTransientReferenceURLs(_ input: inout GenerationInput) {
+        input.imageURLs = nil
+        input.referenceImageURLs = nil
+        input.referenceVideoURLs = nil
+        input.referenceAudioURLs = nil
     }
 
     // MARK: - Shared
@@ -233,40 +323,129 @@ final class GenerationService {
         return FileManager.default.temporaryDirectory
     }
 
+    private static func isArtifactURLAllowed(_ url: URL, input: GenerationInput?) -> Bool {
+        guard url.user == nil,
+              url.password == nil,
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = url.host else {
+            return false
+        }
+        if scheme == "https" || AIProviderEndpoint.isLoopbackHost(host) {
+            return true
+        }
+        guard let profileID = input?.providerProfileID,
+              let profile = AIProviderStore.shared.profile(id: profileID) else {
+            return false
+        }
+        return profile.allowInsecureHTTP
+    }
+
     @discardableResult
     private func downloadAndFinalize(asset: MediaAsset, remoteURL: URL, editor: EditorViewModel) async -> Bool {
+        guard Self.isArtifactURLAllowed(remoteURL, input: asset.generationInput) else {
+            updateGenerationMetadata(asset, editor: editor, status: .failed("Invalid result URL"))
+            return false
+        }
+        asset.pendingDownloadURL = remoteURL
         if asset.generationStatus != .downloading {
             updateGenerationMetadata(asset, editor: editor, status: .downloading)
         }
+        var tempURL: URL?
         do {
-            let (tempURL, _) = try await URLSession.shared.download(from: remoteURL)
-            let realExt = remoteURL.pathExtension.lowercased()
-            if !realExt.isEmpty, realExt != asset.url.pathExtension.lowercased(),
-               ClipType(fileExtension: realExt) != nil {
-                asset.url = asset.url.deletingPathExtension().appendingPathExtension(realExt)
-            }
-            asset.url = try await editor.commitStagedProjectMedia(tempURL, filename: asset.url.lastPathComponent)
-
-            asset.pendingDownloadURL = nil
-            editor.importMediaAsset(asset, skipAppend: true)
-            let finalized = await editor.finalizeImportedAsset(asset)
-            if finalized {
-                editor.appendGenerationLog(for: asset)
-            }
+            let (downloadedURL, _) = try await URLSession.shared.download(from: remoteURL)
+            tempURL = downloadedURL
+            let finalized = try await commitAndFinalize(
+                asset: asset,
+                stagedURL: downloadedURL,
+                suggestedExtension: remoteURL.pathExtension,
+                editor: editor
+            )
+            await Self.cleanupTempFiles([downloadedURL])
             return finalized
         } catch {
+            if let tempURL {
+                await Self.cleanupTempFiles([tempURL])
+            }
             let message = error.localizedDescription
-            Log.generation.error("download failed url=\(remoteURL.absoluteString) error=\(message)")
+            Log.generation.error("download failed host=\(remoteURL.host ?? "unknown") error=\(message)")
             asset.pendingDownloadURL = remoteURL
             updateGenerationMetadata(asset, editor: editor, status: .failed(message))
             return false
         }
     }
 
+    @discardableResult
+    private func writeAndFinalize(
+        asset: MediaAsset,
+        data: Data,
+        fileExtension: String,
+        editor: EditorViewModel
+    ) async -> Bool {
+        if asset.generationStatus != .downloading {
+            updateGenerationMetadata(asset, editor: editor, status: .downloading)
+        }
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("generation-\(UUID().uuidString)")
+            .appendingPathExtension(fileExtension)
+        do {
+            try await Task.detached(priority: .userInitiated) {
+                try data.write(to: tempURL, options: .atomic)
+            }.value
+            let finalized = try await commitAndFinalize(
+                asset: asset,
+                stagedURL: tempURL,
+                suggestedExtension: fileExtension,
+                editor: editor
+            )
+            await Self.cleanupTempFiles([tempURL])
+            return finalized
+        } catch {
+            await Self.cleanupTempFiles([tempURL])
+            let message = error.localizedDescription
+            Log.generation.error("inline generation output write failed error=\(message)")
+            updateGenerationMetadata(asset, editor: editor, status: .failed(message))
+            return false
+        }
+    }
+
+    private func commitAndFinalize(
+        asset: MediaAsset,
+        stagedURL: URL,
+        suggestedExtension: String,
+        editor: EditorViewModel
+    ) async throws -> Bool {
+        let normalizedExtension = suggestedExtension.lowercased()
+        if !normalizedExtension.isEmpty,
+           normalizedExtension != asset.url.pathExtension.lowercased(),
+           ClipType(fileExtension: normalizedExtension) != nil {
+            asset.url = asset.url.deletingPathExtension().appendingPathExtension(normalizedExtension)
+        }
+        asset.url = try await editor.commitStagedProjectMedia(
+            stagedURL,
+            filename: asset.url.lastPathComponent
+        )
+        editor.importMediaAsset(asset, skipAppend: true)
+        let finalized = await editor.finalizeImportedAsset(asset)
+        if finalized {
+            asset.pendingDownloadURL = nil
+            if var input = asset.generationInput {
+                input.providerJob = nil
+                input.backendJobId = nil
+                input.resultURLs = nil
+                asset.generationInput = input
+            }
+            editor.updateManifestMetadata(for: [asset])
+            editor.appendGenerationLog(for: asset)
+        }
+        return finalized
+    }
+
     func retryDownload(asset: MediaAsset, editor: EditorViewModel) {
         guard let remoteURL = asset.pendingDownloadURL else { return }
         Task { @MainActor in
-            await downloadAndFinalize(asset: asset, remoteURL: remoteURL, editor: editor)
+            _ = await downloadAndFinalize(asset: asset, remoteURL: remoteURL, editor: editor)
+            editor.onProjectCheckpointRequired?()
         }
     }
 
@@ -281,37 +460,86 @@ final class GenerationService {
 
         let pending = editor.mediaAssets.filter(\.isRecoveringGeneration)
 
-        let byBackendJob = Dictionary(grouping: pending.compactMap { asset -> (String, MediaAsset)? in
-            guard let backendJobId = asset.generationInput?.backendJobId, !backendJobId.isEmpty else { return nil }
-            return (backendJobId, asset)
-        }, by: { $0.0 })
-
-        for (backendJobId, group) in byBackendJob where !resumedBackendJobIds.contains(backendJobId) {
-            let placeholders = sorted(group.map { $0.1 })
-            resumedBackendJobIds.insert(backendJobId)
+        for asset in pending {
+            guard let input = asset.generationInput,
+                  let resultURLs = input.resultURLs,
+                  !resultURLs.isEmpty else { continue }
+            let key = "result:\(asset.id)"
+            guard !resumedGenerationJobs.contains(key) else { continue }
+            resumedGenerationJobs.insert(key)
+            let outputIndex = input.outputIndex ?? 0
             Task { @MainActor [weak self, weak editor] in
+                defer { self?.resumedGenerationJobs.remove(key) }
                 guard let self, let editor else { return }
-                await self.monitorBackendJob(
-                    backendJobId: backendJobId,
-                    placeholders: placeholders,
-                    editor: editor,
-                    onComplete: nil,
-                    onFailure: nil
-                )
-                self.resumedBackendJobIds.remove(backendJobId)
+                guard resultURLs.indices.contains(outputIndex),
+                      let remoteURL = URL(string: resultURLs[outputIndex]),
+                      Self.isArtifactURLAllowed(remoteURL, input: input) else {
+                    self.updateGenerationMetadata(
+                        asset,
+                        editor: editor,
+                        status: .failed("Invalid result URL")
+                    )
+                    editor.onProjectCheckpointRequired?()
+                    return
+                }
+                _ = await self.downloadAndFinalize(asset: asset, remoteURL: remoteURL, editor: editor)
+                editor.onProjectCheckpointRequired?()
             }
         }
-    }
 
-    private func backendError(_ error: Error) -> (code: String?, message: String) {
-        struct Payload: Decodable { let code: String?; let message: String? }
-        if case let ClientError.ConvexError(data) = error,
-           let json = data.data(using: .utf8),
-           let payload = try? JSONDecoder().decode(Payload.self, from: json),
-           let message = payload.message {
-            return (payload.code, message)
+        let recoverable = pending.compactMap { asset -> (key: String, handle: GenerationJobHandle, asset: MediaAsset)? in
+            guard let input = asset.generationInput else { return nil }
+            if let resultURLs = input.resultURLs, !resultURLs.isEmpty { return nil }
+            let handle: GenerationJobHandle
+            if let providerJob = input.providerJob {
+                handle = providerJob
+            } else if let backendJobID = input.backendJobId, !backendJobID.isEmpty {
+                handle = GenerationJobHandle(
+                    providerProfileID: AIProviderProfile.palmierManagedID,
+                    providerKind: .palmierManaged,
+                    remoteID: backendJobID
+                )
+            } else {
+                return nil
+            }
+            let key = "\(handle.providerProfileID.uuidString):\(handle.remoteID)"
+            return (key, handle, asset)
         }
-        return (nil, error.localizedDescription)
+        let grouped = Dictionary(grouping: recoverable, by: \.key)
+
+        for (key, group) in grouped where !resumedGenerationJobs.contains(key) {
+            guard let handle = group.first?.handle else { continue }
+            let placeholders = sorted(group.map(\.asset))
+            resumedGenerationJobs.insert(key)
+            Task { @MainActor [weak self, weak editor] in
+                defer { self?.resumedGenerationJobs.remove(key) }
+                guard let self, let editor else { return }
+                do {
+                    let runtime = try await AIProviderStore.shared.runtimeProfile(
+                        id: handle.providerProfileID
+                    )
+                    let provider = try GenerationProviderFactory.make(runtimeProfile: runtime)
+                    await self.monitorProviderJob(
+                        provider: provider,
+                        handle: handle,
+                        placeholders: placeholders,
+                        editor: editor,
+                        onComplete: nil,
+                        onFailure: nil
+                    )
+                } catch {
+                    let message = error.localizedDescription
+                    for placeholder in placeholders {
+                        self.updateGenerationMetadata(
+                            placeholder,
+                            editor: editor,
+                            status: .failed(message)
+                        )
+                    }
+                    editor.onProjectCheckpointRequired?()
+                }
+            }
+        }
     }
 
     private func updateGenerationMetadata(
@@ -335,24 +563,30 @@ final class GenerationService {
         at urls: [URL],
         types: [ClipType],
         cacheKeys: [MediaAsset?],
+        provider: any GenerationProvider,
+        providerProfileID: UUID
     ) async throws -> [String] {
         guard !urls.isEmpty else { return [] }
         return try await withThrowingTaskGroup(of: (Int, String).self) { group in
             for (i, url) in urls.enumerated() {
                 let type = types.indices.contains(i) ? types[i] : .image
                 let cacheKey = cacheKeys.indices.contains(i) ? cacheKeys[i] : nil
-                if let cacheKey, let hit = cacheKey.freshRemoteURL {
+                if let cacheKey, let hit = cacheKey.freshRemoteURL(for: providerProfileID) {
                     group.addTask { (i, hit) }
                     continue
                 }
                 let contentType = Self.contentType(for: url, fallback: type)
                 group.addTask {
-                    let uploaded = try await GenerationBackend.uploadReference(
+                    let uploaded = try await provider.uploadReference(
                         fileURL: url,
-                        contentType: contentType,
+                        contentType: contentType
                     )
                     if let cacheKey {
-                        await Self.recordUploadCache(asset: cacheKey, url: uploaded)
+                        await Self.recordUploadCache(
+                            asset: cacheKey,
+                            url: uploaded,
+                            providerProfileID: providerProfileID
+                        )
                     }
                     return (i, uploaded)
                 }
@@ -364,9 +598,22 @@ final class GenerationService {
     }
 
     @MainActor
-    private static func recordUploadCache(asset: MediaAsset, url: String) {
+    private static func recordUploadCache(
+        asset: MediaAsset,
+        url: String,
+        providerProfileID: UUID
+    ) {
+        guard let parsed = URL(string: url),
+              parsed.scheme == "https" || parsed.scheme == "http",
+              parsed.user == nil,
+              parsed.password == nil,
+              parsed.query == nil,
+              parsed.fragment == nil else {
+            return
+        }
         asset.cachedRemoteURL = url
         asset.cachedRemoteURLExpiresAt = Date().addingTimeInterval(uploadCacheTTL)
+        asset.cachedRemoteProviderProfileID = providerProfileID
     }
 
     private static func contentType(for url: URL, fallback: ClipType) -> String {
@@ -402,32 +649,25 @@ final class GenerationService {
         placeholders: [MediaAsset],
         params: BackendGenerationParams,
         genInput: GenerationInput,
+        context: ProviderContext,
         editor: EditorViewModel,
         onComplete: (@MainActor (MediaAsset) -> Void)?,
         onFailure: (@MainActor () -> Void)?
     ) async {
-        let runId = String(UUID().uuidString.prefix(8))
-        Log.generation.notice("run \(runId) start model=\(genInput.model) placeholders=\(placeholders.count)")
-        defer { Log.generation.notice("run \(runId) settled") }
+        let runID = String(UUID().uuidString.prefix(8))
+        Log.generation.notice("run \(runID) start model=\(genInput.model) placeholders=\(placeholders.count)")
+        defer { Log.generation.notice("run \(runID) settled") }
 
-        let jobId: String
+        let start: GenerationProviderStart
         do {
-            jobId = try await GenerationBackend.submit(
-                model: genInput.model,
+            start = try await context.provider.start(request: GenerationProviderRequest(
+                modelID: context.modelID,
                 params: params,
-                projectId: editor.projectId,
-            )
+                projectID: editor.projectId
+            ))
         } catch {
-            let (code, message) = backendError(error)
-            let expected: Set<String> = [
-                "insufficient_credits", "subscription_required", "plan_required",
-                "rate_limited", "invalid_params",
-            ]
-            if let code, expected.contains(code) {
-                Log.generation.warning("submit failed model=\(genInput.model) code=\(code) error=\(message)")
-            } else {
-                Log.generation.error("submit failed model=\(genInput.model) error=\(message)")
-            }
+            let message = error.localizedDescription
+            Log.generation.error("generation submit failed model=\(genInput.model) error=\(message)")
             for placeholder in placeholders {
                 updateGenerationMetadata(placeholder, editor: editor, status: .failed(message))
             }
@@ -435,61 +675,105 @@ final class GenerationService {
             return
         }
 
-        for placeholder in placeholders {
-            updateGenerationMetadata(placeholder, editor: editor, status: .generating) { input in
-                input.backendJobId = jobId
-            }
-        }
-        editor.onProjectCheckpointRequired?()
-
-        await monitorBackendJob(
-            backendJobId: jobId,
-            placeholders: placeholders,
-            editor: editor,
-            failIfUnavailable: true,
-            onComplete: onComplete,
-            onFailure: onFailure
-        )
-    }
-
-    private func monitorBackendJob(
-        backendJobId: String,
-        placeholders: [MediaAsset],
-        editor: EditorViewModel,
-        failIfUnavailable: Bool = false,
-        onComplete: (@MainActor (MediaAsset) -> Void)?,
-        onFailure: (@MainActor () -> Void)?
-    ) async {
-        guard let publisher = GenerationBackend.subscribe(jobId: backendJobId) else {
-            if failIfUnavailable {
-                for placeholder in placeholders {
-                    updateGenerationMetadata(placeholder, editor: editor, status: .failed("Backend not configured"))
-                }
-                editor.onProjectCheckpointRequired?()
-                onFailure?()
-            }
-            return
-        }
-
-        for await jobOpt in backendJobStream(from: publisher) {
-            guard let job = jobOpt else { continue }
-            if await applyBackendJobUpdate(
-                job: job,
-                backendJobId: backendJobId,
+        switch start {
+        case .completed(let artifacts):
+            await finalizeSuccess(
+                artifacts: artifacts,
                 placeholders: placeholders,
                 editor: editor,
                 onComplete: onComplete,
                 onFailure: onFailure
-            ) {
-                return
+            )
+
+        case .job(let handle):
+            for placeholder in placeholders {
+                updateGenerationMetadata(placeholder, editor: editor, status: .generating) { input in
+                    input.providerProfileID = handle.providerProfileID
+                    input.providerKind = handle.providerKind
+                    input.providerJob = handle
+                    input.backendJobId = handle.providerKind == .palmierManaged ? handle.remoteID : nil
+                }
             }
+            editor.onProjectCheckpointRequired?()
+            await monitorProviderJob(
+                provider: context.provider,
+                handle: handle,
+                placeholders: placeholders,
+                editor: editor,
+                onComplete: onComplete,
+                onFailure: onFailure
+            )
+        }
+    }
+
+    private func monitorProviderJob(
+        provider: any GenerationProvider,
+        handle: GenerationJobHandle,
+        placeholders: [MediaAsset],
+        editor: EditorViewModel,
+        onComplete: (@MainActor (MediaAsset) -> Void)?,
+        onFailure: (@MainActor () -> Void)?
+    ) async {
+        do {
+            for try await update in provider.updates(for: handle) {
+                switch update {
+                case .queued, .running:
+                    if updateProviderJobMetadata(placeholders, handle: handle, editor: editor) {
+                        editor.onProjectCheckpointRequired?()
+                    }
+
+                case .succeeded(let artifacts):
+                    _ = updateProviderJobMetadata(placeholders, handle: handle, editor: editor)
+                    await finalizeSuccess(
+                        artifacts: artifacts,
+                        placeholders: placeholders,
+                        editor: editor,
+                        onComplete: onComplete,
+                        onFailure: onFailure
+                    )
+                    return
+
+                case .failed(let code):
+                    let message = GenerationProviderError.remoteFailure(code).localizedDescription
+                    Log.generation.error("generation job failed provider=\(handle.providerKind.rawValue) code=\(code)")
+                    for placeholder in placeholders {
+                        updateGenerationMetadata(placeholder, editor: editor, status: .failed(message)) { input in
+                            input.providerJob = handle
+                        }
+                    }
+                    editor.onProjectCheckpointRequired?()
+                    onFailure?()
+                    return
+                }
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            let message = error.localizedDescription
+            Log.generation.error("generation monitor failed provider=\(handle.providerKind.rawValue) error=\(message)")
+            for placeholder in placeholders {
+                updateGenerationMetadata(placeholder, editor: editor, status: .failed(message)) { input in
+                    input.providerJob = handle
+                }
+            }
+            editor.onProjectCheckpointRequired?()
+            onFailure?()
+            return
         }
 
-        // Stream ended without a terminal update: finish from persisted URLs, else retry on reopen.
         let persisted = placeholders.compactMap(\.generationInput?.resultURLs).first ?? []
-        guard !persisted.isEmpty else { return }
+        var recoveredArtifacts: [GenerationArtifact] = []
+        recoveredArtifacts.reserveCapacity(persisted.count)
+        for value in persisted {
+            guard !value.isEmpty,
+                  let url = URL(string: value),
+                  let scheme = url.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https" else { return }
+            recoveredArtifacts.append(.remoteURL(url))
+        }
+        guard !recoveredArtifacts.isEmpty else { return }
         await finalizeSuccess(
-            urlStrings: persisted,
+            artifacts: recoveredArtifacts,
             placeholders: placeholders,
             editor: editor,
             onComplete: onComplete,
@@ -497,83 +781,24 @@ final class GenerationService {
         )
     }
 
-    private func backendJobStream<Failure: Error>(
-        from publisher: AnyPublisher<BackendGenerationJob?, Failure>
-    ) -> AsyncStream<BackendGenerationJob?> {
-        AsyncStream<BackendGenerationJob?> { continuation in
-            let cancellable = publisher
-                .receive(on: DispatchQueue.main)
-                .sink(
-                    receiveCompletion: { _ in continuation.finish() },
-                    receiveValue: { value in continuation.yield(value) },
-                )
-            continuation.onTermination = { _ in cancellable.cancel() }
-        }
-    }
-
-    private func applyBackendJobUpdate(
-        job: BackendGenerationJob,
-        backendJobId: String,
-        placeholders: [MediaAsset],
-        editor: EditorViewModel,
-        onComplete: (@MainActor (MediaAsset) -> Void)?,
-        onFailure: (@MainActor () -> Void)?
-    ) async -> Bool {
-        switch job.status {
-        case .succeeded:
-            if updateBackendJobMetadata(
-                placeholders,
-                backendJobId: backendJobId,
-                editor: editor
-            ) {
-                editor.onProjectCheckpointRequired?()
-            }
-            await finalizeSuccess(
-                urlStrings: job.resultUrls ?? [],
-                placeholders: placeholders,
-                editor: editor,
-                onComplete: onComplete,
-                onFailure: onFailure,
-            )
-            return true
-        case .failed:
-            let message = job.errorMessage ?? "Generation failed"
-            Log.generation.error("job \(backendJobId) failed: \(message)")
-            for placeholder in placeholders {
-                updateGenerationMetadata(placeholder, editor: editor, status: .failed(message)) { input in
-                    input.backendJobId = backendJobId
-                }
-            }
-            editor.onProjectCheckpointRequired?()
-            onFailure?()
-            return true
-        case .queued, .running:
-            if updateBackendJobMetadata(
-                placeholders,
-                backendJobId: backendJobId,
-                editor: editor
-            ) {
-                editor.onProjectCheckpointRequired?()
-            }
-            return false
-        }
-    }
-
     @discardableResult
-    private func updateBackendJobMetadata(
+    private func updateProviderJobMetadata(
         _ placeholders: [MediaAsset],
-        backendJobId: String,
+        handle: GenerationJobHandle,
         editor: EditorViewModel
     ) -> Bool {
         var changed = false
         for placeholder in placeholders {
             guard placeholder.generationStatus != .downloading,
-                    placeholder.generationStatus != .generating ||
-                    placeholder.generationInput?.backendJobId != backendJobId else {
+                  placeholder.generationStatus != .generating ||
+                  placeholder.generationInput?.providerJob != handle else {
                 continue
             }
             updateGenerationMetadata(placeholder, editor: editor, status: .generating) { input in
-                input.backendJobId = backendJobId
+                input.providerProfileID = handle.providerProfileID
+                input.providerKind = handle.providerKind
+                input.providerJob = handle
+                input.backendJobId = handle.providerKind == .palmierManaged ? handle.remoteID : nil
             }
             changed = true
         }
@@ -581,37 +806,76 @@ final class GenerationService {
     }
 
     private func finalizeSuccess(
-        urlStrings: [String],
+        artifacts: [GenerationArtifact],
         placeholders: [MediaAsset],
         editor: EditorViewModel,
         onComplete: (@MainActor (MediaAsset) -> Void)?,
         onFailure: (@MainActor () -> Void)?
     ) async {
-        guard !urlStrings.isEmpty else {
-            Log.generation.error("backend job succeeded with no resultUrls")
+        guard !artifacts.isEmpty else {
+            Log.generation.error("generation succeeded with no artifacts")
             for placeholder in placeholders {
-                updateGenerationMetadata(placeholder, editor: editor, status: .failed("No URL in response"))
+                updateGenerationMetadata(placeholder, editor: editor, status: .failed("No output in response"))
             }
             onFailure?()
             return
         }
-        if urlStrings.count < placeholders.count {
-            Log.generation.notice("backend returned \(urlStrings.count) URL(s) for \(placeholders.count) placeholder(s); marking extras as failed")
+        if artifacts.count < placeholders.count {
+            Log.generation.notice("provider returned \(artifacts.count) output(s) for \(placeholders.count) placeholder(s); marking extras as failed")
         }
 
-        var finalized: [MediaAsset] = []
-        for (i, placeholder) in placeholders.enumerated() {
-            let outputIndex = placeholder.generationInput?.outputIndex ?? i
-            guard outputIndex < urlStrings.count, let remote = URL(string: urlStrings[outputIndex]) else {
-                updateGenerationMetadata(placeholder, editor: editor, status: .failed("No URL for placeholder"))
+        // Empty markers preserve output indices when a provider mixes inline and remote artifacts.
+        let persistedURLs = artifacts.map { artifact -> String in
+            guard case .remoteURL(let url) = artifact else { return "" }
+            return url.absoluteString
+        }
+        var outputs: [(placeholder: MediaAsset, artifact: GenerationArtifact)] = []
+        outputs.reserveCapacity(placeholders.count)
+        for (index, placeholder) in placeholders.enumerated() {
+            let outputIndex = placeholder.generationInput?.outputIndex ?? index
+            guard artifacts.indices.contains(outputIndex) else {
+                updateGenerationMetadata(placeholder, editor: editor, status: .failed("No output for placeholder"))
+                continue
+            }
+
+            let artifact = artifacts[outputIndex]
+            if case .remoteURL(let remoteURL) = artifact,
+               !Self.isArtifactURLAllowed(remoteURL, input: placeholder.generationInput) {
+                updateGenerationMetadata(placeholder, editor: editor, status: .failed("Invalid result URL"))
                 continue
             }
             updateGenerationMetadata(placeholder, editor: editor, status: .downloading) { input in
-                input.resultURLs = urlStrings
+                if case .remoteURL = artifact {
+                    input.resultURLs = persistedURLs
+                } else {
+                    input.resultURLs = nil
+                }
             }
-            if await downloadAndFinalize(asset: placeholder, remoteURL: remote, editor: editor) {
-                onComplete?(placeholder)
-                finalized.append(placeholder)
+            outputs.append((placeholder, artifact))
+        }
+        editor.onProjectCheckpointRequired?()
+
+        var finalized: [MediaAsset] = []
+        for output in outputs {
+            let didFinalize: Bool
+            switch output.artifact {
+            case .remoteURL(let remoteURL):
+                didFinalize = await downloadAndFinalize(
+                    asset: output.placeholder,
+                    remoteURL: remoteURL,
+                    editor: editor
+                )
+            case .data(let data, let fileExtension):
+                didFinalize = await writeAndFinalize(
+                    asset: output.placeholder,
+                    data: data,
+                    fileExtension: fileExtension,
+                    editor: editor
+                )
+            }
+            if didFinalize {
+                onComplete?(output.placeholder)
+                finalized.append(output.placeholder)
             }
         }
 
