@@ -266,62 +266,13 @@ struct OpenAIMediaGenerationProvider: GenerationProvider {
         guard Self.soraModelIDs.contains(modelID) || configuredVideoModel else {
             throw GenerationProviderError.unsupported("video model")
         }
-        if params.sourceVideoURL != nil
-            || params.startFrameURL != nil
-            || params.endFrameURL != nil
-            || !params.referenceImageURLs.isEmpty
-            || !params.referenceVideoURLs.isEmpty
-            || !params.referenceAudioURLs.isEmpty {
-            throw GenerationProviderError.unsupported("video references")
-        }
-
-        var fields: [(String, String)] = [
-            ("model", modelID),
-            ("prompt", params.prompt),
-            ("seconds", String(params.duration)),
-        ]
-        if let size = Self.videoSize(resolution: params.resolution, aspectRatio: params.aspectRatio) {
-            fields.append(("size", size))
-        }
-
-        let boundary = UUID().uuidString
-        let body = Self.multipartBody(boundary: boundary, fields: fields, files: [])
-
-        let url = try resolveEndpoint("videos")
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.applyProviderHeaders(runtimeProfile)
-        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "content-type")
-        request.setValue("application/json", forHTTPHeaderField: "accept")
-        request.httpBody = body
-
-        let response = try await perform(request, maxResponseBytes: Self.jsonMaxBytes)
-        let payload = try decodeWhitelistedVideoObject(from: response.data)
-        guard let remoteID = payload.id, !remoteID.isEmpty else {
-            throw GenerationProviderError.invalidResponse("video id")
-        }
-
-        let statusURL = try resolveEndpoint("videos/\(remoteID)")
-        let responseURL = try resolveEndpoint("videos/\(remoteID)/content")
-        let handle = GenerationJobHandle(
-            providerProfileID: runtimeProfile.profile.id,
-            providerKind: .openAIMedia,
-            remoteID: remoteID,
-            statusURL: statusURL.absoluteString,
-            responseURL: responseURL.absoluteString,
-            metadata: ["modelID": .string(modelID)]
+        let profile = try videoEgressProfile()
+        let client = ConfigurableVideoJobClient(
+            runtimeProfile: runtimeProfile,
+            profile: profile,
+            transport: transport
         )
-        return .job(handle)
-    }
-
-    private static func videoSize(resolution: String?, aspectRatio: String) -> String? {
-        switch (resolution, aspectRatio) {
-        case ("720p", "16:9"): return "1280x720"
-        case ("720p", "9:16"): return "720x1280"
-        case ("1080p", "16:9"): return "1920x1080"
-        case ("1080p", "9:16"): return "1080x1920"
-        default: return nil
-        }
+        return try await client.start(modelID: modelID, params: params)
     }
 
     // MARK: - Polling
@@ -331,73 +282,18 @@ struct OpenAIMediaGenerationProvider: GenerationProvider {
         continuation: AsyncThrowingStream<GenerationProviderUpdate, Error>.Continuation
     ) async throws {
         try validateOpenAIMediaProfile()
-        guard handle.providerProfileID == runtimeProfile.profile.id,
-              handle.providerKind == .openAIMedia else {
-            throw GenerationProviderError.providerMismatch
-        }
-
-        guard let statusRaw = handle.statusURL,
-              let responseRaw = handle.responseURL else {
-            throw GenerationProviderError.invalidResponse("handle urls")
-        }
-        let statusURL = try validatedCredentialURL(statusRaw)
-        let responseURL = try validatedCredentialURL(responseRaw)
-
-        let timeout = timeoutSeconds()
-        let deadline = Date().addingTimeInterval(timeout)
-
-        while true {
-            try Task.checkCancellation()
-            if Date() >= deadline {
-                throw GenerationProviderError.remoteFailure("timeout")
-            }
-
-            var request = URLRequest(url: statusURL)
-            request.httpMethod = "GET"
-            request.applyProviderHeaders(runtimeProfile)
-            request.setValue("application/json", forHTTPHeaderField: "accept")
-
-            let response = try await perform(request, maxResponseBytes: Self.jsonMaxBytes)
-            let payload = try decodeWhitelistedVideoObject(from: response.data)
-            let status = (payload.status ?? "").lowercased()
-
-            switch status {
-            case "queued":
-                continuation.yield(.queued)
-            case "in_progress", "running":
-                continuation.yield(.running(progress: Self.normalizeProgress(payload.progress)))
-            case "completed":
-                let data = try await fetchVideoContent(from: responseURL)
-                continuation.yield(.succeeded([.data(data, fileExtension: "mp4")]))
-                return
-            case "failed", "cancelled":
-                continuation.yield(.failed(code: status))
-                return
-            default:
-                throw GenerationProviderError.invalidResponse("status")
-            }
-
-            try Task.checkCancellation()
-            try await Task.sleep(for: .seconds(Self.pollIntervalSeconds))
-        }
+        let profile = try videoEgressProfile()
+        let client = ConfigurableVideoJobClient(
+            runtimeProfile: runtimeProfile,
+            profile: profile,
+            transport: transport
+        )
+        try await client.pollUpdates(for: handle, continuation: continuation)
     }
 
-    private func fetchVideoContent(from url: URL) async throws -> Data {
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.applyProviderHeaders(runtimeProfile)
-        let response = try await perform(request, maxResponseBytes: Self.mediaMaxBytes)
-        guard !response.data.isEmpty else {
-            throw GenerationProviderError.invalidResponse("video content")
-        }
-        return response.data
-    }
-
-    private static func normalizeProgress(_ value: Double?) -> Double? {
-        guard let value, value.isFinite else { return nil }
-        if value >= 0, value <= 1 { return value }
-        if value > 1, value <= 100 { return value / 100 }
-        return nil
+    private func videoEgressProfile() throws -> VideoEgressProfile {
+        let options = runtimeProfile.profile.generation?.options ?? [:]
+        return try VideoEgressProfileCatalog.resolve(from: options)
     }
 
     // MARK: - Transport

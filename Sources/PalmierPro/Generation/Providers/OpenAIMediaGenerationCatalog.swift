@@ -21,19 +21,33 @@ enum OpenAIMediaGenerationCatalog {
             ttsEntry(profileID: profile.id, modelID: ttsHDModelID, displayName: "TTS-1 HD"),
         ]
 
+        let egress = (try? VideoEgressProfileCatalog.resolve(
+            from: profile.generation?.options ?? [:]
+        )) ?? VideoEgressProfileCatalog.openaiSora
+        let egressCaps = egress.capabilities
+
         if allowed.contains(sora2ModelID) {
-            raw.append(videoEntry(profileID: profile.id, modelID: sora2ModelID, displayName: "Sora 2"))
+            raw.append(videoEntry(
+                profileID: profile.id,
+                modelID: sora2ModelID,
+                displayName: "Sora 2",
+                capabilities: VideoEgressProfileCatalog.openaiSora.capabilities
+            ))
         }
         if allowed.contains(sora2ProModelID) {
-            raw.append(videoEntry(profileID: profile.id, modelID: sora2ProModelID, displayName: "Sora 2 Pro"))
+            raw.append(videoEntry(
+                profileID: profile.id,
+                modelID: sora2ProModelID,
+                displayName: "Sora 2 Pro",
+                capabilities: VideoEgressProfileCatalog.openaiSora.capabilities
+            ))
         }
         for modelID in modelIDs where !builtInModelIDs.contains(modelID) {
             raw.append(videoEntry(
                 profileID: profile.id,
                 modelID: modelID,
                 displayName: modelID,
-                durations: [4, 8, 12, 15],
-                resolutions: ["720p"]
+                capabilities: egressCaps
             ))
         }
 
@@ -117,10 +131,14 @@ enum OpenAIMediaGenerationCatalog {
         profileID: UUID,
         modelID: String,
         displayName: String,
-        durations: [Int] = [4, 8, 12],
-        resolutions: [String] = ["720p", "1080p"]
+        capabilities: VideoEgressProfile.Capabilities?
     ) -> CatalogEntry {
-        CatalogEntry(
+        let durations = capabilities?.durations ?? [4, 8, 12]
+        let resolutions = capabilities?.resolutions ?? ["720p", "1080p"]
+        let aspectRatios = capabilities?.aspectRatios ?? ["16:9", "9:16"]
+        let supportsFirstFrame = capabilities?.supportsFirstFrame ?? false
+        let maxReferenceImages = capabilities?.maxReferenceImages ?? 0
+        return CatalogEntry(
             id: GenerationModelIdentifier.qualify(profileID: profileID, modelID: modelID),
             providerProfileID: profileID,
             providerKind: .openAIMedia,
@@ -131,10 +149,10 @@ enum OpenAIMediaGenerationCatalog {
             uiCapabilities: .video(VideoCaps(
                 durations: durations,
                 resolutions: resolutions,
-                aspectRatios: ["16:9", "9:16"],
-                supportsFirstFrame: false,
+                aspectRatios: aspectRatios,
+                supportsFirstFrame: supportsFirstFrame,
                 supportsLastFrame: false,
-                maxReferenceImages: 0,
+                maxReferenceImages: maxReferenceImages,
                 maxReferenceVideos: 0,
                 maxReferenceAudios: 0,
                 maxTotalReferences: nil,
