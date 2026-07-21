@@ -63,9 +63,11 @@ enum VideoEgressProfileCatalog {
             ),
             result: .init(
                 prefer: [
-                    "download_url", "url", "video.url", "output.url", "data.url",
-                    "result_url", "output_url",
+                    // magic666 / NewAPI Grok completes with video_url (verified 2026-07-21).
+                    "video_url", "download_url", "url", "video.url", "output.url",
+                    "data.url", "result_url", "output_url",
                 ],
+                // Only used when no URL fields exist (true OpenAI Sora content path).
                 fallbackContentPath: "videos/{{jobId}}/content"
             )
         ),
@@ -107,8 +109,8 @@ enum VideoEgressProfileCatalog {
             ),
             result: .init(
                 prefer: [
-                    "download_url", "url", "video.url", "output.url", "data.url",
-                    "result_url", "output_url",
+                    "video_url", "download_url", "url", "video.url", "output.url",
+                    "data.url", "result_url", "output_url",
                 ],
                 fallbackContentPath: "videos/{{jobId}}/content"
             )

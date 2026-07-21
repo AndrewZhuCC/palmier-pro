@@ -414,7 +414,8 @@ struct OpenAIMediaGenerationProviderTests {
                     "id": "hub_1",
                     "status": "completed",
                     "progress": 100,
-                    "download_url": "https://cdn.example/out.mp4",
+                    // magic666-style field name
+                    "video_url": "https://cdn.example/out.mp4",
                 ])
             }
             Issue.record("Unexpected URL \(path)")
