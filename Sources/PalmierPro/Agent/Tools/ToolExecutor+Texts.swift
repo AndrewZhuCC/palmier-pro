@@ -55,6 +55,8 @@ struct ParsedTextBackgroundPatch {
 struct ParsedTextStylePatch {
     let fontName: String?
     let fontSize: Double?
+    let widthScale: Double?
+    let heightScale: Double?
     let isBold: Bool?
     let isItalic: Bool?
     let isUnderlined: Bool?
@@ -70,7 +72,8 @@ struct ParsedTextStylePatch {
     let background: ParsedTextBackgroundPatch?
 
     var hasAnyField: Bool {
-        fontName != nil || fontSize != nil || isBold != nil || isItalic != nil
+        fontName != nil || fontSize != nil || widthScale != nil || heightScale != nil
+            || isBold != nil || isItalic != nil
             || isUnderlined != nil || isStruckThrough != nil || isOverlined != nil
             || tracking != nil || lineSpacing != nil || fontCase != nil
             || color != nil || alignment != nil || outline?.hasAnyField == true
@@ -78,7 +81,8 @@ struct ParsedTextStylePatch {
     }
 
     var affectsLayout: Bool {
-        fontName != nil || fontSize != nil || isBold != nil || isItalic != nil
+        fontName != nil || fontSize != nil || widthScale != nil || heightScale != nil
+            || isBold != nil || isItalic != nil
             || tracking != nil || lineSpacing != nil || fontCase != nil
             || outline?.affectsLayout == true || shadow?.affectsLayout == true
             || background?.affectsLayout == true
@@ -119,7 +123,8 @@ extension ToolExecutor {
         try validateUnknownKeys(
             args,
             allowed: [
-                "fontName", "fontSize", "bold", "italic", "underline", "strikethrough", "overline",
+                "fontName", "fontSize", "widthScale", "heightScale",
+                "bold", "italic", "underline", "strikethrough", "overline",
                 "tracking", "lineSpacing", "fontCase",
                 "color", "alignment", "outline", "shadow", "background",
             ],
@@ -133,6 +138,8 @@ extension ToolExecutor {
         return ParsedTextStylePatch(
             fontName: try optionalString(args, key: "fontName", path: path),
             fontSize: try optionalNumber(args, key: "fontSize", path: path, range: 12...300),
+            widthScale: try optionalNumber(args, key: "widthScale", path: path, range: TextStyle.axisScaleRange),
+            heightScale: try optionalNumber(args, key: "heightScale", path: path, range: TextStyle.axisScaleRange),
             isBold: try optionalBool(args, key: "bold", path: path),
             isItalic: try optionalBool(args, key: "italic", path: path),
             isUnderlined: try optionalBool(args, key: "underline", path: path),
@@ -230,7 +237,20 @@ extension ToolExecutor {
         range: ClosedRange<Double>? = nil
     ) throws -> Double? {
         guard args.keys.contains(key) else { return nil }
-        guard let value = args.double(key), value.isFinite else {
+        guard let raw = args[key], !isJSONBoolean(raw) else {
+            throw ToolError("\(path).\(key): expected finite number")
+        }
+        let value: Double
+        if let raw = raw as? Double {
+            value = raw
+        } else if let raw = raw as? Int {
+            value = Double(raw)
+        } else if let raw = raw as? NSNumber {
+            value = raw.doubleValue
+        } else {
+            throw ToolError("\(path).\(key): expected finite number")
+        }
+        guard value.isFinite else {
             throw ToolError("\(path).\(key): expected finite number")
         }
         if let range, !range.contains(value) {
@@ -277,6 +297,8 @@ extension ToolExecutor {
     static func applyTextStylePatch(_ patch: ParsedTextStylePatch, to style: inout TextStyle) {
         if let f = patch.fontName { style.fontName = f }
         if let s = patch.fontSize { style.fontSize = s }
+        if let s = patch.widthScale { style.widthScale = s }
+        if let s = patch.heightScale { style.heightScale = s }
         if let b = patch.isBold { style.isBold = b }
         if let i = patch.isItalic { style.isItalic = i }
         if let u = patch.isUnderlined { style.isUnderlined = u }
@@ -344,31 +366,49 @@ extension ToolExecutor {
         path: String
     ) throws -> Transform? {
         guard let tDict else { return nil }
-        try validateUnknownKeys(tDict, allowed: ["centerX", "centerY", "width", "height"], path: "\(path).transform")
-        let cX = tDict.double("centerX"), cY = tDict.double("centerY")
-        let w = tDict.double("width"), h = tDict.double("height")
-        if cX == nil && cY == nil && w == nil && h == nil { return nil }
+        try validateUnknownKeys(tDict, allowed: ["centerX", "centerY", "width", "height", "rotation"], path: "\(path).transform")
+        let cX = try optionalNumber(tDict, key: "centerX", path: "\(path).transform")
+        let cY = try optionalNumber(tDict, key: "centerY", path: "\(path).transform")
+        let w = try optionalNumber(tDict, key: "width", path: "\(path).transform")
+        let h = try optionalNumber(tDict, key: "height", path: "\(path).transform")
+        let rotation = try optionalNumber(tDict, key: "rotation", path: "\(path).transform")
+
+        func autoFit(centerX: Double, centerY: Double) -> Transform {
+            let natural = TextLayout.naturalSize(content: content, style: style, maxWidth: CGFloat(canvas.w) * 0.9, canvasHeight: CGFloat(canvas.h))
+            return Transform(
+                centerX: centerX,
+                centerY: centerY,
+                width: Double(natural.width) / canvas.w,
+                height: Double(natural.height) / canvas.h,
+                rotation: rotation ?? 0
+            )
+        }
+
+        if cX == nil && cY == nil && w == nil && h == nil {
+            guard rotation != nil else { return nil }
+            return autoFit(centerX: 0.5, centerY: 0.5)
+        }
         guard let cx = cX, let cy = cY else {
             throw ToolError("\(path): transform must be either {centerX, centerY} for auto-fit, or all four of {centerX, centerY, width, height}")
         }
         if let ww = w, let hh = h {
-            return Transform(center: (cx, cy), width: ww, height: hh)
+            return Transform(centerX: cx, centerY: cy, width: ww, height: hh, rotation: rotation ?? 0)
         }
         guard w == nil && h == nil else {
             throw ToolError("\(path): transform must be either {centerX, centerY} for auto-fit, or all four of {centerX, centerY, width, height}")
         }
-        let natural = TextLayout.naturalSize(content: content, style: style, maxWidth: CGFloat(canvas.w) * 0.9, canvasHeight: CGFloat(canvas.h))
-        return Transform(center: (cx, cy), width: Double(natural.width) / canvas.w, height: Double(natural.height) / canvas.h)
+        return autoFit(centerX: cx, centerY: cy)
     }
 
     private func parseUpdateTextTransform(_ tDict: [String: Any]?, path: String) throws -> ParsedTransform? {
         guard let tDict else { return nil }
-        try validateUnknownKeys(tDict, allowed: ["centerX", "centerY", "width", "height"], path: "\(path).transform")
+        try validateUnknownKeys(tDict, allowed: ["centerX", "centerY", "width", "height", "rotation"], path: "\(path).transform")
         let transform = ParsedTransform(
-            centerX: tDict.double("centerX"),
-            centerY: tDict.double("centerY"),
-            width: tDict.double("width"),
-            height: tDict.double("height"),
+            centerX: try optionalNumber(tDict, key: "centerX", path: "\(path).transform"),
+            centerY: try optionalNumber(tDict, key: "centerY", path: "\(path).transform"),
+            width: try optionalNumber(tDict, key: "width", path: "\(path).transform"),
+            height: try optionalNumber(tDict, key: "height", path: "\(path).transform"),
+            rotation: try optionalNumber(tDict, key: "rotation", path: "\(path).transform"),
             flipHorizontal: nil,
             flipVertical: nil
         )
@@ -419,7 +459,7 @@ extension ToolExecutor {
             }
 
             let transform = try parseAddTextTransform(
-                entry["transform"] as? [String: Any],
+                optionalObject(entry, key: "transform", path: path),
                 content: content, style: style,
                 canvas: (Double(editor.timeline.width), Double(editor.timeline.height)),
                 path: path
@@ -511,7 +551,10 @@ extension ToolExecutor {
         guard !clipIds.isEmpty else { throw ToolError("Provide a non-empty 'clipIds' array or a 'captionGroupId'") }
 
         let textStylePatch = try parseTextStylePatch(args, path: "update_text")
-        let transform = try parseUpdateTextTransform(args["transform"] as? [String: Any], path: "update_text")
+        let transform = try parseUpdateTextTransform(
+            optionalObject(args, key: "transform", path: "update_text"),
+            path: "update_text"
+        )
         let animation = try parseTextAnimation(preset: args.string("animation"), highlightColor: args.string("highlightColor"), path: "update_text")
         let shouldSetAnimation = args.string("animation") != nil
         let highlightOnly = shouldSetAnimation ? nil : try parseColorHex(args.string("highlightColor"), path: "update_text")
@@ -540,10 +583,20 @@ extension ToolExecutor {
                 notes.append("Content change cleared word timings on \(timingCleared.count) clip\(timingCleared.count == 1 ? "" : "s") — karaoke highlighting falls back to plain text there.")
             }
         }
+        if transform?.rotation != nil {
+            let cleared = clipIds.filter { editor.clipFor(id: $0)?.rotationTrack != nil }
+            if !cleared.isEmpty {
+                notes.append("Static rotation cleared existing rotation keyframes on: \(cleared.joined(separator: ", ")).")
+            }
+        }
 
+        var beforeClips: [String: Clip] = [:]
+        for id in clipIds {
+            beforeClips[id] = editor.clipFor(id: id)
+        }
         let snapshot = timelineSnapshot(editor)
         let actionName = clipIds.count == 1 ? "Update Text (Agent)" : "Update Texts (Agent)"
-        let shouldFitToContent = transform == nil && (hasContent || textStylePatch?.affectsLayout == true)
+        let shouldFitToContent = transform?.hasLayoutField != true && (hasContent || textStylePatch?.affectsLayout == true)
         let canvasW = Double(editor.timeline.width)
         let canvasH = Double(editor.timeline.height)
         editor.undo.perform(actionName) {
@@ -560,16 +613,7 @@ extension ToolExecutor {
                     clip.textStyle = style
                 }
                 if let t = transform {
-                    let cur = clip.transform
-                    var next = Transform(
-                        center: (t.centerX ?? cur.center.x, t.centerY ?? cur.center.y),
-                        width: t.width ?? cur.width,
-                        height: t.height ?? cur.height
-                    )
-                    next.rotation = cur.rotation
-                    next.flipHorizontal = cur.flipHorizontal
-                    next.flipVertical = cur.flipVertical
-                    clip.transform = next
+                    t.apply(to: &clip)
                 }
                 if shouldSetAnimation {
                     if let animation {
@@ -597,6 +641,13 @@ extension ToolExecutor {
             }
         }
 
-        return mutationResult(editor, since: snapshot, touched: clipIds, notes: notes)
+        let changed = beforeClips.contains { id, clip in editor.clipFor(id: id) != clip }
+        return mutationResult(
+            editor,
+            since: snapshot,
+            touched: clipIds,
+            extra: ["changed": changed],
+            notes: notes
+        )
     }
 }

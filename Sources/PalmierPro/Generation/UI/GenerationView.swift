@@ -190,10 +190,6 @@ struct GenerationView: View {
                 }
                 ProjectActivityButton()
                 Button {
-                    editor.pendingEditReplacementClipId = nil
-                    editor.pendingEditTrimmedSource = nil
-                    editor.pendingEditAudioPlacement = nil
-                    editor.pendingPanelSeed = nil
                     editFolderId = nil
                     editor.showGenerationPanel = false
                 } label: {
@@ -303,8 +299,7 @@ struct GenerationView: View {
             clearReferences()
             if newValue == .audio { resetAudioState() }
             editFolderId = nil
-            editor.pendingEditTrimmedSource = nil
-            editor.pendingEditAudioPlacement = nil
+            editor.clearPendingGenerationPanelState(preservingReplacement: true)
         }
         .onChange(of: selectedVideoModelIndex) { _, _ in
             guard !isPopulatingPanel else { return }

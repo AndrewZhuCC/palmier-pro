@@ -304,6 +304,8 @@ struct ToolExecutorReadOnlyTests {
             volume: 0.987654321
         )
         clip.opacity = 0.123456789
+        clip.edgeRounding = 0.456789
+        clip.edgeSoftness = 0.234567
         clip.transform = Transform(
             centerX: 0.123456789,
             centerY: 0.987654321,
@@ -336,8 +338,11 @@ struct ToolExecutorReadOnlyTests {
         let tracks = json?["tracks"] as? [[String: Any]]
         let outClip = (tracks?.first?["clips"] as? [[String: Any]])?.first
         #expect(outClip?["speed"] as? Double == 1.235)
-        #expect(outClip?["volume"] as? Double == 0.988)
+        #expect(outClip?["volumeDb"] as? Double == -0.108)
+        #expect(outClip?["volume"] == nil)
         #expect(outClip?["opacity"] as? Double == 0.123)
+        #expect(outClip?["edgeRounding"] as? Double == 0.457)
+        #expect(outClip?["edgeSoftness"] as? Double == 0.235)
     }
 
     @Test func getTimelineOmitsDefaultValuedFields() async throws {
@@ -367,7 +372,8 @@ struct ToolExecutorReadOnlyTests {
         #expect(clip?["startFrame"] == nil)
         #expect(clip?["durationFrames"] == nil)
         for defaulted in [
-            "mediaType", "sourceClipType", "speed", "volume", "opacity",
+            "mediaType", "sourceClipType", "speed", "volume", "volumeDb", "opacity",
+            "edgeRounding", "edgeSoftness",
             "trimStartFrame", "trimEndFrame", "fadeInFrames", "fadeOutFrames",
             "fadeInInterpolation", "fadeOutInterpolation", "transform", "crop",
         ] {
@@ -1236,16 +1242,16 @@ struct ToolExecutorClipTests {
 
     // MARK: - set_clip_properties
 
-    @Test func setClipPropertiesChangesSpeedAndVolume() async throws {
+    @Test func setClipPropertiesChangesSpeedAndVolumeDb() async throws {
         let (h, asset) = await setupWithVideoTrack()
         let clipId = await addedClip(in: h, asset: asset)
         let result = await h.runRaw("set_clip_properties", args: [
-            "clipIds": [clipId], "speed": 2.0, "volume": 0.5,
+            "clipIds": [clipId], "speed": 2.0, "volumeDb": -6.0,
         ])
         #expect(result.isError == false, "\(ToolHarness.textOf(result))")
         let clip = h.editor.timeline.tracks[0].clips[0]
         #expect(clip.speed == 2.0)
-        #expect(clip.volume == 0.5)
+        #expect(abs(clip.volume - VolumeScale.linearFromDb(-6)) < 0.0001)
     }
 
     @Test func setClipPropertiesAppliesUniformlyToMultipleClips() async throws {
@@ -1257,11 +1263,39 @@ struct ToolExecutorClipTests {
         ])
         let id2 = h.editor.timeline.tracks[0].clips.first { $0.id != id1 }!.id
         _ = await h.runRaw("set_clip_properties", args: [
-            "clipIds": [id1, id2], "volume": 0.4,
+            "clipIds": [id1, id2], "volumeDb": -12.0,
         ])
         for clip in h.editor.timeline.tracks[0].clips {
-            #expect(clip.volume == 0.4, "all listed clips share the property value")
+            #expect(
+                abs(clip.volume - VolumeScale.linearFromDb(-12)) < 0.0001,
+                "all listed clips share the property value"
+            )
         }
+    }
+
+    @Test func setClipPropertiesSetsEdgeAdjustmentsOnVisualClips() async throws {
+        let (h, asset) = await setupWithVideoTrack()
+        let clipId = await addedClip(in: h, asset: asset)
+
+        let result = await h.runRaw("set_clip_properties", args: [
+            "clipIds": [clipId], "edgeRounding": 0.4, "edgeSoftness": 0.25,
+        ])
+
+        #expect(result.isError == false, "\(ToolHarness.textOf(result))")
+        #expect(h.editor.clipFor(id: clipId)?.edgeRounding == 0.4)
+        #expect(h.editor.clipFor(id: clipId)?.edgeSoftness == 0.25)
+    }
+
+    @Test func setClipPropertiesRejectsEdgeAdjustmentsOnNonVisualClips() async {
+        let clip = Fixtures.clip(id: "audio", mediaType: .audio, start: 0, duration: 30)
+        let h = ToolHarness(timeline: Fixtures.timeline(tracks: [Fixtures.audioTrack(clips: [clip])]))
+
+        let result = await h.runRaw("set_clip_properties", args: [
+            "clipIds": [clip.id], "edgeRounding": 0.4, "edgeSoftness": 0.25,
+        ])
+
+        #expect(result.isError)
+        #expect(ToolHarness.textOf(result).contains("visual clips"))
     }
 
     @Test func setClipPropertiesRejectsUnknownKey() async throws {
@@ -1271,6 +1305,16 @@ struct ToolExecutorClipTests {
             "clipIds": [clipId], "unknownField": 99,
         ])
         #expect(result.isError)
+    }
+
+    @Test func setClipPropertiesRejectsRemovedNormalizedVolume() async throws {
+        let (h, asset) = await setupWithVideoTrack()
+        let clipId = await addedClip(in: h, asset: asset)
+        let result = await h.runRaw("set_clip_properties", args: [
+            "clipIds": [clipId], "volume": 0.5,
+        ])
+        #expect(result.isError)
+        #expect(ToolHarness.textOf(result).contains("unknown field(s) 'volume'"))
     }
 
     @Test func setClipPropertiesRejectsMissingClipId() async throws {
@@ -1335,7 +1379,11 @@ struct ToolExecutorClipTests {
         let clipId = await addedClip(in: h, asset: asset)
         let cases: [(String, Any)] = [
             ("speed", 0.0), ("speed", -2.0),
-            ("volume", 5.0), ("opacity", -1.0), ("trimStartFrame", -100),
+            ("volumeDb", 15.1), ("volumeDb", -60.1),
+            ("opacity", -1.0),
+            ("edgeRounding", -0.1), ("edgeRounding", 1.1),
+            ("edgeSoftness", -0.1), ("edgeSoftness", 1.1),
+            ("trimStartFrame", -100),
         ]
         for (field, value) in cases {
             var args: [String: Any] = ["clipIds": [clipId]]
@@ -1379,15 +1427,15 @@ struct ToolExecutorClipTests {
     @Test func setClipPropertiesScalarClearsExistingKeyframeTrack() async throws {
         let (h, clipId) = await setupClipForKeyframes()
         _ = await h.runRaw("set_keyframes", args: [
-            "clipId": clipId, "property": "volume",
-            "keyframes": [[0, 1.0], [30, 0.0]],
+            "clipId": clipId, "property": "volumeDb",
+            "keyframes": [[0, 0.0], [30, -60.0]],
         ])
         _ = await h.runRaw("set_clip_properties", args: [
-            "clipIds": [clipId], "volume": 0.5,
+            "clipIds": [clipId], "volumeDb": -6.0,
         ])
         guard let loc = h.editor.findClip(id: clipId) else { Issue.record("clip gone"); return }
         let clip = h.editor.timeline.tracks[loc.trackIndex].clips[loc.clipIndex]
-        #expect(clip.volume == 0.5)
+        #expect(abs(clip.volume - VolumeScale.linearFromDb(-6)) < 0.0001)
         #expect(clip.volumeTrack == nil)
     }
 
@@ -1402,19 +1450,20 @@ struct ToolExecutorClipTests {
         return (h, ids[0])
     }
 
-    @Test func setKeyframesSetsVolume() async throws {
+    @Test func setKeyframesSetsVolumeDb() async throws {
         let (h, clipId) = await setupClipForKeyframes()
         let result = await h.runRaw("set_keyframes", args: [
-            "clipId": clipId, "property": "volume",
-            "keyframes": [[0, 1.0], [30, 0.0, "linear"], [60, 1.0]],
+            "clipId": clipId, "property": "volumeDb",
+            "keyframes": [[0, 0.0], [30, -6.0, "linear"], [60, -60.0]],
         ])
         #expect(result.isError == false, "\(ToolHarness.textOf(result))")
         guard let loc = h.editor.findClip(id: clipId) else { Issue.record("clip gone"); return }
         let kfs = h.editor.timeline.tracks[loc.trackIndex].clips[loc.clipIndex].volumeTrack?.keyframes ?? []
         #expect(kfs.count == 3)
-        #expect(kfs[0].frame == 0 && kfs[0].value == 1.0 && kfs[0].interpolationOut == .smooth)
-        #expect(kfs[1].frame == 30 && kfs[1].value == 0.0 && kfs[1].interpolationOut == .linear)
-        #expect(kfs[2].frame == 60 && kfs[2].value == 1.0)
+        #expect(kfs[0].frame == 0 && kfs[0].value == 0 && kfs[0].interpolationOut == .smooth)
+        #expect(kfs[1].value == -6)
+        #expect(kfs[1].frame == 30 && kfs[1].interpolationOut == .linear)
+        #expect(kfs[2].frame == 60 && kfs[2].value == VolumeScale.floorDb)
     }
 
     @Test func setKeyframesClearsWhenEmpty() async throws {
@@ -1433,22 +1482,42 @@ struct ToolExecutorClipTests {
     @Test func setKeyframesSortsAndDedupes() async throws {
         let (h, clipId) = await setupClipForKeyframes()
         let result = await h.runRaw("set_keyframes", args: [
-            "clipId": clipId, "property": "volume",
-            "keyframes": [[60, 0.3], [0, 1.0], [30, 0.5], [30, 0.8]],
+            "clipId": clipId, "property": "volumeDb",
+            "keyframes": [[60, -12.0], [0, 0.0], [30, -6.0], [30, -3.0]],
         ])
         #expect(result.isError == false, "\(ToolHarness.textOf(result))")
         guard let loc = h.editor.findClip(id: clipId) else { Issue.record("clip gone"); return }
         let kfs = h.editor.timeline.tracks[loc.trackIndex].clips[loc.clipIndex].volumeTrack?.keyframes ?? []
         #expect(kfs.map(\.frame) == [0, 30, 60])
-        #expect(kfs[0].value == 1.0)
-        #expect(kfs[1].value == 0.8, "duplicate frame 30 keeps the last value (last-write-wins)")
-        #expect(kfs[2].value == 0.3)
+        #expect(kfs[0].value == 0)
+        #expect(kfs[1].value == -3, "duplicate frame 30 keeps the last value (last-write-wins)")
+        #expect(kfs[2].value == -12)
+    }
+
+    @Test func setKeyframesRejectsVolumeDbOutsideSupportedRange() async throws {
+        let (h, clipId) = await setupClipForKeyframes()
+        let result = await h.runRaw("set_keyframes", args: [
+            "clipId": clipId, "property": "volumeDb",
+            "keyframes": [[0, 15.01]],
+        ])
+        #expect(result.isError)
+        #expect(ToolHarness.textOf(result).contains("between -60.0 and 15.0"))
+    }
+
+    @Test func setKeyframesRejectsOpacityOutsideNormalizedRange() async throws {
+        let (h, clipId) = await setupClipForKeyframes()
+        let result = await h.runRaw("set_keyframes", args: [
+            "clipId": clipId, "property": "opacity",
+            "keyframes": [[0, 1.01]],
+        ])
+        #expect(result.isError)
+        #expect(ToolHarness.textOf(result).contains("between 0.0 and 1.0"))
     }
 
     @Test func setKeyframesRejectsNonFiniteValues() async throws {
         let (h, clipId) = await setupClipForKeyframes()
         let result = await h.runRaw("set_keyframes", args: [
-            "clipId": clipId, "property": "volume",
+            "clipId": clipId, "property": "volumeDb",
             "keyframes": [[0, Double.infinity]],
         ])
         #expect(result.isError)
@@ -1487,10 +1556,19 @@ struct ToolExecutorClipTests {
         #expect(result.isError)
     }
 
+    @Test func setKeyframesRejectsRemovedNormalizedVolumeProperty() async throws {
+        let (h, clipId) = await setupClipForKeyframes()
+        let result = await h.runRaw("set_keyframes", args: [
+            "clipId": clipId, "property": "volume", "keyframes": [[0, 1.0]],
+        ])
+        #expect(result.isError)
+        #expect(ToolHarness.textOf(result).contains("Unknown property 'volume'"))
+    }
+
     @Test func setKeyframesRejectsMissingClipId() async throws {
         let h = ToolHarness()
         let result = await h.runRaw("set_keyframes", args: [
-            "clipId": "ghost", "property": "volume", "keyframes": [[0, 1.0]],
+            "clipId": "ghost", "property": "volumeDb", "keyframes": [[0, 0.0]],
         ])
         #expect(result.isError)
     }
@@ -1498,8 +1576,8 @@ struct ToolExecutorClipTests {
     @Test func getTimelineEmitsTupleKeyframes() async throws {
         let (h, clipId) = await setupClipForKeyframes()
         _ = await h.runRaw("set_keyframes", args: [
-            "clipId": clipId, "property": "volume",
-            "keyframes": [[0, 1.0], [30, 0.0, "linear"]],
+            "clipId": clipId, "property": "volumeDb",
+            "keyframes": [[0, 0.0], [30, -60.0, "linear"]],
         ])
         _ = await h.runRaw("set_keyframes", args: [
             "clipId": clipId, "property": "position",
@@ -1511,8 +1589,10 @@ struct ToolExecutorClipTests {
             .first { ($0["id"] as? String).map { clipId.hasPrefix($0) } == true }
         let kfs = clip?["keyframes"] as? [String: Any]
         #expect(kfs != nil, "keyframes should be present on the clip in get_timeline output")
-        let volRows = kfs?["volume"] as? [[Any]]
+        let volRows = kfs?["volumeDb"] as? [[Any]]
         #expect(volRows?.count == 2)
+        #expect(abs(((volRows?[0][1] as? NSNumber)?.doubleValue ?? -1) - 0) < 0.0001)
+        #expect(abs(((volRows?[1][1] as? NSNumber)?.doubleValue ?? -1) - -60) < 0.0001)
         // Default interp 'smooth' is omitted from the tuple.
         #expect(volRows?[0].count == 2)
         // Non-default interp appears as the trailing element.
@@ -1524,6 +1604,20 @@ struct ToolExecutorClipTests {
         // Track wrappers are removed.
         #expect(clip?["volumeTrack"] == nil)
         #expect(clip?["positionTrack"] == nil)
+    }
+
+    @Test func getTimelineCollapsesConstantVolumeUsingDecibels() async throws {
+        let (h, clipId) = await setupClipForKeyframes()
+        _ = await h.runRaw("set_keyframes", args: [
+            "clipId": clipId, "property": "volumeDb",
+            "keyframes": [[0, -60.0], [60, -60.0]],
+        ])
+        let json = try await h.runOK("get_timeline") as? [String: Any]
+        let clip = ((json?["tracks"] as? [[String: Any]]) ?? [])
+            .flatMap { ($0["clips"] as? [[String: Any]]) ?? [] }
+            .first { ($0["id"] as? String).map { clipId.hasPrefix($0) } == true }
+        #expect((clip?["volumeDb"] as? NSNumber)?.doubleValue == -60)
+        #expect(clip?["keyframes"] == nil)
     }
 
     @Test func getTimelineCollapsesConstantAndIdentityKeyframes() async throws {
@@ -1606,15 +1700,15 @@ struct ToolExecutorClipTests {
     @Test func setClipPropertiesEchoesResultingValuesAndKeyframeClear() async throws {
         let (h, clipId) = await setupClipForKeyframes()
         _ = await h.runRaw("set_keyframes", args: [
-            "clipId": clipId, "property": "volume",
-            "keyframes": [[0, 1.0], [30, 0.0]],
+            "clipId": clipId, "property": "volumeDb",
+            "keyframes": [[0, 0.0], [30, -60.0]],
         ])
         let json = try await h.runOK("set_clip_properties", args: [
-            "clipIds": [clipId], "volume": 0.5, "speed": 2.0,
+            "clipIds": [clipId], "volumeDb": -6.0, "speed": 2.0,
         ]) as? [String: Any]
         let clip = (json?["clips"] as? [[String: Any]])?.first
         // Resulting values visible: halved duration from speed, scalar volume, keyframes gone.
-        #expect(clip?["volume"] as? Double == 0.5)
+        #expect(clip?["volumeDb"] as? Double == -6)
         #expect(clip?["speed"] as? Double == 2.0)
         #expect(clip?["keyframes"] == nil)
         #expect(((json?["notes"] as? [String])?.first ?? "").contains("cleared existing keyframes"))
@@ -1720,7 +1814,7 @@ struct ToolExecutorClipTests {
         ]])
         let audioClip = h.editor.timeline.tracks.first { $0.type == .audio }?.clips.first
         let audioId = try #require(audioClip?.id)
-        _ = await h.runRaw("set_clip_properties", args: ["clipIds": [audioId], "volume": 0.0])
+        _ = await h.runRaw("set_clip_properties", args: ["clipIds": [audioId], "volumeDb": -60.0])
 
         let json = try await h.runOK("get_timeline") as? [String: Any]
         let tracks = (json?["tracks"] as? [[String: Any]]) ?? []
@@ -1731,7 +1825,7 @@ struct ToolExecutorClipTests {
         let audio = video?["audio"] as? [String: Any]
         #expect((audio?["id"] as? String).map { audioId.hasPrefix($0) } == true)
         #expect(audio?["track"] as? Int == audioTrack?["index"] as? Int)
-        #expect(audio?["volume"] as? Double == 0)
+        #expect(audio?["volumeDb"] as? Double == -60)
         #expect(video?["linkGroupId"] == nil)
 
         // The partner is not repeated on its own track; a count stands in.
@@ -1745,6 +1839,18 @@ struct ToolExecutorClipTests {
 struct ToolExecutorTextFolderTests {
 
     // MARK: - add_texts
+
+    @Test func updateTextSchemaExposesIndependentTextScale() throws {
+        let tool = try #require(ToolDefinitions.mcpServer.first { $0.name == .updateText })
+        let properties = try #require(tool.inputSchema["properties"] as? [String: [String: Any]])
+        let style = try #require(properties["style"])
+        let styleProperties = try #require(style["properties"] as? [String: [String: Any]])
+
+        #expect((styleProperties["widthScale"]?["minimum"] as? NSNumber)?.doubleValue == 0.1)
+        #expect((styleProperties["widthScale"]?["maximum"] as? NSNumber)?.doubleValue == 10)
+        #expect((styleProperties["heightScale"]?["minimum"] as? NSNumber)?.doubleValue == 0.1)
+        #expect((styleProperties["heightScale"]?["maximum"] as? NSNumber)?.doubleValue == 10)
+    }
 
     @Test func addTextsCreatesNewTrackWhenIndexOmitted() async throws {
         let h = ToolHarness()
@@ -1794,6 +1900,8 @@ struct ToolExecutorTextFolderTests {
                 "content": "Styled",
                 "style": [
                     "fontSize": 54,
+                    "widthScale": 1.5,
+                    "heightScale": 0.8,
                     "tracking": 5,
                     "lineSpacing": 12,
                     "fontCase": "uppercase",
@@ -1820,6 +1928,8 @@ struct ToolExecutorTextFolderTests {
         #expect(result.isError == false, "\(ToolHarness.textOf(result))")
         let style = h.editor.timeline.tracks[0].clips[0].textStyle
         #expect(style?.fontSize == 54)
+        #expect(style?.widthScale == 1.5)
+        #expect(style?.heightScale == 0.8)
         #expect(style?.tracking == 5)
         #expect(style?.lineSpacing == 12)
         #expect(style?.fontCase == .uppercase)
@@ -1850,6 +1960,23 @@ struct ToolExecutorTextFolderTests {
             ]]
         ])
         #expect(result.isError)
+    }
+
+    @Test func addTextsRejectsOutOfRangeTextScale() async {
+        let h = ToolHarness()
+        _ = h.editor.insertTrack(at: 0, type: .video)
+        let result = await h.runRaw("add_texts", args: [
+            "entries": [[
+                "trackIndex": 0,
+                "startFrame": 0,
+                "endFrame": 60,
+                "content": "Invalid",
+                "style": ["widthScale": 0],
+            ]]
+        ])
+
+        #expect(result.isError)
+        #expect(h.editor.timeline.tracks[0].clips.isEmpty)
     }
 
     @Test func addTextsRejectsAudioTargetTrack() async throws {
