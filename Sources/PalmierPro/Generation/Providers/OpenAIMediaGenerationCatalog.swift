@@ -22,10 +22,19 @@ enum OpenAIMediaGenerationCatalog {
         ]
 
         if allowed.contains(sora2ModelID) {
-            raw.append(soraEntry(profileID: profile.id, modelID: sora2ModelID, displayName: "Sora 2"))
+            raw.append(videoEntry(profileID: profile.id, modelID: sora2ModelID, displayName: "Sora 2"))
         }
         if allowed.contains(sora2ProModelID) {
-            raw.append(soraEntry(profileID: profile.id, modelID: sora2ProModelID, displayName: "Sora 2 Pro"))
+            raw.append(videoEntry(profileID: profile.id, modelID: sora2ProModelID, displayName: "Sora 2 Pro"))
+        }
+        for modelID in modelIDs where !builtInModelIDs.contains(modelID) {
+            raw.append(videoEntry(
+                profileID: profile.id,
+                modelID: modelID,
+                displayName: modelID,
+                durations: [4, 8, 12, 15],
+                resolutions: ["720p"]
+            ))
         }
 
         guard !allowed.isEmpty else { return raw }
@@ -34,6 +43,10 @@ enum OpenAIMediaGenerationCatalog {
             return allowed.contains(rawID)
         }
     }
+
+    private static let builtInModelIDs: Set<String> = [
+        imageModelID, ttsModelID, ttsHDModelID, sora2ModelID, sora2ProModelID,
+    ]
 
     // MARK: - Entries
 
@@ -100,7 +113,13 @@ enum OpenAIMediaGenerationCatalog {
         )
     }
 
-    private static func soraEntry(profileID: UUID, modelID: String, displayName: String) -> CatalogEntry {
+    private static func videoEntry(
+        profileID: UUID,
+        modelID: String,
+        displayName: String,
+        durations: [Int] = [4, 8, 12],
+        resolutions: [String] = ["720p", "1080p"]
+    ) -> CatalogEntry {
         CatalogEntry(
             id: GenerationModelIdentifier.qualify(profileID: profileID, modelID: modelID),
             providerProfileID: profileID,
@@ -110,8 +129,8 @@ enum OpenAIMediaGenerationCatalog {
             displayName: displayName,
             responseShape: .video,
             uiCapabilities: .video(VideoCaps(
-                durations: [4, 8, 12],
-                resolutions: ["720p", "1080p"],
+                durations: durations,
+                resolutions: resolutions,
                 aspectRatios: ["16:9", "9:16"],
                 supportsFirstFrame: false,
                 supportsLastFrame: false,

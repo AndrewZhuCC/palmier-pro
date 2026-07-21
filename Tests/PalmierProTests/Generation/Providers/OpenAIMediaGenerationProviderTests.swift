@@ -52,6 +52,21 @@ struct OpenAIMediaGenerationCatalogTests {
         #expect(entries.map(\.providerModelID) == ["tts-1-hd"])
     }
 
+    @Test func includesExplicitCustomVideoModelWithFifteenSecondDuration() throws {
+        let profile = openAIMediaProfile(modelIDs: ["grok-imagine-video"])
+        let entries = OpenAIMediaGenerationCatalog.entries(profile: profile)
+        let entry = try #require(entries.first(where: { $0.providerModelID == "grok-imagine-video" }))
+
+        #expect(entry.kind == .video)
+        if case .video(let caps) = entry.uiCapabilities {
+            #expect(caps.durations == [4, 8, 12, 15])
+            #expect(caps.resolutions == ["720p"])
+            #expect(caps.aspectRatios == ["16:9", "9:16"])
+        } else {
+            Issue.record("Expected custom video capabilities")
+        }
+    }
+
     @Test func imageAndTTSCapabilities() throws {
         let profile = openAIMediaProfile(modelIDs: [])
         let entries = OpenAIMediaGenerationCatalog.entries(profile: profile)
@@ -314,6 +329,37 @@ struct OpenAIMediaGenerationProviderTests {
         #expect(handle.statusURL == "https://api.openai.com/v1/videos/video_123")
         #expect(handle.responseURL == "https://api.openai.com/v1/videos/video_123/content")
         #expect(handle.metadata["modelID"] == .string("sora-2"))
+    }
+
+    @Test func customVideoModelUsesOpenAIVideoEndpoint() async throws {
+        let transport = FakeOpenAIMediaTransport { request in
+            #expect(request.url?.absoluteString == "https://api.openai.com/v1/videos")
+            let bodyText = String(decoding: try #require(request.httpBody), as: UTF8.self)
+            #expect(bodyText.contains("grok-imagine-video"))
+            #expect(bodyText.contains("seconds"))
+            #expect(bodyText.contains("15"))
+            return try FakeOpenAIMediaTransport.jsonResponse(["id": "grok_video_123", "status": "queued"])
+        }
+
+        let runtime = openAIMediaRuntime(modelIDs: ["grok-imagine-video"])
+        let provider = OpenAIMediaGenerationProvider(runtimeProfile: runtime, transport: transport)
+        let start = try await provider.start(request: GenerationProviderRequest(
+            modelID: "grok-imagine-video",
+            params: .video(VideoGenerationParams(
+                prompt: "a neon city at dusk",
+                duration: 15,
+                aspectRatio: "16:9",
+                resolution: "1080p"
+            )),
+            projectID: nil
+        ))
+
+        guard case .job(let handle) = start else {
+            Issue.record("Expected custom video job handle")
+            return
+        }
+        #expect(handle.remoteID == "grok_video_123")
+        #expect(handle.metadata["modelID"] == JSONValue.string("grok-imagine-video"))
     }
 
     @Test func videoPollProgressThenContent() async throws {

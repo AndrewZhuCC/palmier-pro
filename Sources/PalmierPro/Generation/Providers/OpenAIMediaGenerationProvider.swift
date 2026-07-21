@@ -262,7 +262,8 @@ struct OpenAIMediaGenerationProvider: GenerationProvider {
     // MARK: - Video
 
     private func startVideo(modelID: String, params: VideoGenerationParams) async throws -> GenerationProviderStart {
-        guard Self.soraModelIDs.contains(modelID) else {
+        let configuredVideoModel = runtimeProfile.profile.generation?.modelIDs.contains(modelID) == true
+        guard Self.soraModelIDs.contains(modelID) || configuredVideoModel else {
             throw GenerationProviderError.unsupported("video model")
         }
         if params.sourceVideoURL != nil
