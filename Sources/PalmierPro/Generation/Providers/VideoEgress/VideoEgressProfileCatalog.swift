@@ -38,7 +38,7 @@ enum VideoEgressProfileCatalog {
         )
     )
 
-    /// Magic/Apifox-style Grok: seconds + aspect_ratio + input_reference.
+    /// Magic/Apifox-style Grok: seconds + aspect_ratio (+ size for OpenAI-compat gateways).
     static let jsonSecondsAspect = VideoEgressProfile(
         id: "json-seconds-aspect",
         create: .init(
@@ -49,6 +49,8 @@ enum VideoEgressProfileCatalog {
                 "prompt": .string("{{prompt}}"),
                 "seconds": .string("{{duration:string}}"),
                 "aspect_ratio": .string("{{aspectRatio}}"),
+                // Some NewAPI relays ignore aspect_ratio and only honor OpenAI-style size.
+                "size": .string("{{size}}"),
             ]),
             optional: .object([
                 "input_reference": .string("{{startFrameURL}}"),
@@ -60,7 +62,10 @@ enum VideoEgressProfileCatalog {
                 map: defaultJSONStatusMap
             ),
             result: .init(
-                prefer: ["download_url", "url", "output.url", "data.url"],
+                prefer: [
+                    "download_url", "url", "video.url", "output.url", "data.url",
+                    "result_url", "output_url",
+                ],
                 fallbackContentPath: "videos/{{jobId}}/content"
             )
         ),
@@ -101,7 +106,10 @@ enum VideoEgressProfileCatalog {
                 map: defaultJSONStatusMap
             ),
             result: .init(
-                prefer: ["download_url", "url", "output.url", "data.url"],
+                prefer: [
+                    "download_url", "url", "video.url", "output.url", "data.url",
+                    "result_url", "output_url",
+                ],
                 fallbackContentPath: "videos/{{jobId}}/content"
             )
         ),

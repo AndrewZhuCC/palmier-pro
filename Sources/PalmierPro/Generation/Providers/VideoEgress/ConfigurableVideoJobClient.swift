@@ -58,7 +58,26 @@ struct ConfigurableVideoJobClient: Sendable {
                 context: context
             )
             request.setValue("application/json", forHTTPHeaderField: "content-type")
-            request.httpBody = try JSONEncoder().encode(body)
+            // Match other providers: encode via Foundation JSON, not JSONEncoder(JSONValue).
+            do {
+                request.httpBody = try JSONSerialization.data(
+                    withJSONObject: body.foundationValue,
+                    options: [.sortedKeys]
+                )
+            } catch {
+                throw GenerationProviderError.invalidResponse("videoProfile body encode")
+            }
+            if case .object(let object) = body {
+                let promptLen: Int
+                if case .string(let prompt) = object["prompt"] {
+                    promptLen = prompt.count
+                } else {
+                    promptLen = 0
+                }
+                Log.generation.notice(
+                    "video egress create profile=\(profile.id) model=\(modelID) promptChars=\(promptLen) keys=\(object.keys.sorted().joined(separator: ","))"
+                )
+            }
         } else {
             let fields = try VideoEgressRenderer.renderMultipartFields(
                 fields: profile.create.fields ?? [:],

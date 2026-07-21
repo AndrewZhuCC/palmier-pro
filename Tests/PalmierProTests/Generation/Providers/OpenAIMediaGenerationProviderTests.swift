@@ -345,7 +345,7 @@ struct OpenAIMediaGenerationProviderTests {
             #expect(object["prompt"] as? String == "a neon city at dusk")
             #expect(object["seconds"] as? String == "15")
             #expect(object["aspect_ratio"] as? String == "16:9")
-            #expect(object["size"] == nil)
+            #expect(object["size"] as? String == "1280x720")
             return try FakeOpenAIMediaTransport.jsonResponse([
                 "id": "grok_video_123",
                 "status": "processing",
