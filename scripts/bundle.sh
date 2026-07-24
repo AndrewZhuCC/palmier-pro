@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Usage:
-#   scripts/bundle.sh [release|debug]           # ad-hoc signed dev build
+#   scripts/bundle.sh [release|debug]           # local build (release: stable identity, debug: ad-hoc)
 #   scripts/bundle.sh debug --fast              # fastest: skip dSYM + deep sign, just env+build
 #   scripts/bundle.sh release --sign            # build + Developer ID codesign
 #   scripts/bundle.sh release --dist            # build + sign + notarize + staple + DMG
@@ -34,6 +34,7 @@ if [ -f "$ROOT/$ENV_FILE" ]; then
 fi
 
 SIGNING_IDENTITY="${SIGNING_IDENTITY:-Developer ID Application: Palmier, Inc. (MMFLRC7562)}"
+LOCAL_SIGN_IDENTITY="${LOCAL_SIGN_IDENTITY:-PalmierPro Stable Local Signing}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-palmier-notary}"
 SENTRY_DSN="${SENTRY_DSN:-}"
 POSTHOG_PROJECT_TOKEN="${POSTHOG_PROJECT_TOKEN:-}"
@@ -45,6 +46,19 @@ RESOURCES="$ROOT/Sources/PalmierPro/Resources"
 APP="$ROOT/.build/PalmierPro.app"
 ZIP="$ROOT/.build/PalmierPro.zip"
 DMG="$ROOT/.build/PalmierPro.dmg"
+
+require_local_signing_identity() {
+  if ! security find-identity -p codesigning "$HOME/Library/Keychains/login.keychain-db" \
+      | grep -F "$LOCAL_SIGN_IDENTITY" >/dev/null; then
+    echo "error: local code-signing identity not found in the login keychain: $LOCAL_SIGN_IDENTITY" >&2
+    echo "       Create it in Keychain Access or set LOCAL_SIGN_IDENTITY to an existing identity." >&2
+    exit 1
+  fi
+}
+
+if [ "$CONFIG" = "release" ] && { [ "$MODE" = "dev" ] || [ "$MODE" = "fast" ]; }; then
+  require_local_signing_identity
+fi
 
 echo "==> Building ($CONFIG)"
 TRAITS="BundledSpeech"
@@ -166,8 +180,12 @@ install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/Mac
 touch "$APP"
 
 if [ "$MODE" = "fast" ]; then
-  echo "==> Codesigning main app with $SIGNING_IDENTITY (no timestamp, no helpers)"
-  codesign --force --sign "$SIGNING_IDENTITY" "$APP"
+  FAST_SIGNING_IDENTITY="$SIGNING_IDENTITY"
+  if [ "$CONFIG" = "release" ]; then
+    FAST_SIGNING_IDENTITY="$LOCAL_SIGN_IDENTITY"
+  fi
+  echo "==> Codesigning main app with $FAST_SIGNING_IDENTITY (no timestamp, no helpers)"
+  codesign --force --sign "$FAST_SIGNING_IDENTITY" "$APP"
   codesign --verify --deep --strict --verbose=2 "$APP"
   echo "==> Done: $APP (fast mode — stable identity, no dSYM)"
   exit 0
@@ -192,11 +210,18 @@ upload_dsyms() {
 }
 
 if [ "$MODE" = "dev" ]; then
-  echo "==> Ad-hoc signing dev app"
-  codesign --force --deep --sign - "$APP"
-  codesign --verify --strict --verbose=2 "$APP"
+  if [ "$CONFIG" = "release" ]; then
+    echo "==> Codesigning local release app with $LOCAL_SIGN_IDENTITY"
+    codesign --force --deep --sign "$LOCAL_SIGN_IDENTITY" "$APP"
+    SIGNED_DESCRIPTION="locally signed release"
+  else
+    echo "==> Ad-hoc signing debug app"
+    codesign --force --deep --sign - "$APP"
+    SIGNED_DESCRIPTION="ad-hoc signed debug"
+  fi
+  codesign --verify --deep --strict --verbose=2 "$APP"
   upload_dsyms
-  echo "==> Done: $APP (ad-hoc signed)"
+  echo "==> Done: $APP ($SIGNED_DESCRIPTION)"
   exit 0
 fi
 
